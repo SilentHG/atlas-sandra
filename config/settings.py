@@ -44,7 +44,7 @@ class ATLASSettings(BaseSettings):
     alpaca_base_url:   str = Field("https://paper-api.alpaca.markets", alias="ALPACA_BASE_URL")
 
     # ── Database ─────────────────────────────────────────────
-    timescaledb_host:     str       = Field("localhost",  alias="TIMESCALEDB_HOST")
+    timescaledb_host:     str       = Field("127.0.0.1",  alias="TIMESCALEDB_HOST")
     timescaledb_port:     int       = Field(5432,         alias="TIMESCALEDB_PORT")
     timescaledb_db:       str       = Field("atlas",      alias="TIMESCALEDB_DB")
     timescaledb_user:     str       = Field("atlas_user", alias="TIMESCALEDB_USER")

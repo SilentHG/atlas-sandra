@@ -19,8 +19,14 @@ async def init_pool(min_size: int = 2, max_size: int = 10) -> asyncpg.Pool:
     global _pool
     if _pool is None:
         logger.info("Initialising TimescaleDB connection pool …")
+        pw = settings.timescaledb_password.get_secret_value()
         _pool = await asyncpg.create_pool(
-            dsn=settings.db_dsn,
+            host=settings.timescaledb_host,
+            port=settings.timescaledb_port,
+            database=settings.timescaledb_db,
+            user=settings.timescaledb_user,
+            password=pw,
+            ssl=False,
             min_size=min_size,
             max_size=max_size,
             command_timeout=60,
