@@ -55,8 +55,8 @@ class AlpacaConnector:
     """
 
     def __init__(self) -> None:
-        self._api_key    = settings.alpaca_api_key.get_secret_value()
-        self._secret_key = settings.alpaca_secret_key.get_secret_value()
+        self._api_key    = settings.alpaca_api_key
+        self._secret_key = settings.alpaca_secret_key
         self._base_url   = settings.alpaca_base_url.rstrip("/")
         self._client: httpx.AsyncClient | None = None
 
@@ -391,8 +391,8 @@ async def _main() -> None:
     logger.info("[alpaca] Base URL : {}", settings.alpaca_base_url)
     logger.info(
         "[alpaca] API Key  : {}…{}",
-        settings.alpaca_api_key.get_secret_value()[:6],
-        settings.alpaca_api_key.get_secret_value()[-4:],
+        settings.alpaca_api_key[:6],
+        settings.alpaca_api_key[-4:],
     )
 
     async with AlpacaConnector() as conn:

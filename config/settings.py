@@ -1,7 +1,7 @@
 """
 ATLAS Configuration Management
 ================================
-Loads all settings from environment variables / keys.env.
+Loads all settings from environment variables / config/keys.env.
 Uses pydantic-settings for type-safe config.
 """
 
@@ -27,35 +27,35 @@ class ATLASSettings(BaseSettings):
 
     # ── Environment ──────────────────────────────────────────
     environment: str = Field("development", alias="ENVIRONMENT")
-    log_level: str   = Field("INFO",        alias="LOG_LEVEL")
+    log_level:   str = Field("INFO",        alias="LOG_LEVEL")
 
     # ── LLM ──────────────────────────────────────────────────
-    anthropic_api_key: SecretStr = Field(..., alias="ANTHROPIC_API_KEY")
+    anthropic_api_key: str = Field(..., alias="ANTHROPIC_API_KEY")
 
     # ── Market Data ──────────────────────────────────────────
-    polygon_api_key: SecretStr = Field(..., alias="POLYGON_API_KEY")
+    polygon_api_key: str = Field(..., alias="POLYGON_API_KEY")
 
     # ── Exchanges ────────────────────────────────────────────
-    binance_api_key: SecretStr    = Field(..., alias="BINANCE_API_KEY")
-    binance_secret_key: SecretStr = Field(..., alias="BINANCE_SECRET_KEY")
+    binance_api_key:    str = Field(..., alias="BINANCE_API_KEY")
+    binance_secret_key: str = Field(..., alias="BINANCE_SECRET_KEY")
 
-    alpaca_api_key: SecretStr    = Field(..., alias="ALPACA_API_KEY")
-    alpaca_secret_key: SecretStr = Field(..., alias="ALPACA_SECRET_KEY")
-    alpaca_base_url: str         = Field("https://paper-api.alpaca.markets", alias="ALPACA_BASE_URL")
+    alpaca_api_key:    str = Field(..., alias="ALPACA_API_KEY")
+    alpaca_secret_key: str = Field(..., alias="ALPACA_SECRET_KEY")
+    alpaca_base_url:   str = Field("https://paper-api.alpaca.markets", alias="ALPACA_BASE_URL")
 
     # ── Database ─────────────────────────────────────────────
-    timescaledb_host:     str = Field("localhost", alias="TIMESCALEDB_HOST")
-    timescaledb_port:     int = Field(5432,        alias="TIMESCALEDB_PORT")
-    timescaledb_db:       str = Field("atlas",     alias="TIMESCALEDB_DB")
-    timescaledb_user:     str = Field("atlas_user",alias="TIMESCALEDB_USER")
-    timescaledb_password: SecretStr = Field(...,   alias="TIMESCALEDB_PASSWORD")
+    timescaledb_host:     str       = Field("localhost",  alias="TIMESCALEDB_HOST")
+    timescaledb_port:     int       = Field(5432,         alias="TIMESCALEDB_PORT")
+    timescaledb_db:       str       = Field("atlas",      alias="TIMESCALEDB_DB")
+    timescaledb_user:     str       = Field("atlas_user", alias="TIMESCALEDB_USER")
+    timescaledb_password: SecretStr = Field(...,          alias="TIMESCALEDB_PASSWORD")
 
     # ── Redis ────────────────────────────────────────────────
-    redis_host:     str = Field("localhost", alias="REDIS_HOST")
-    redis_port:     int = Field(6379,        alias="REDIS_PORT")
-    redis_password: SecretStr = Field(...,   alias="REDIS_PASSWORD")
+    redis_host:     str       = Field("localhost", alias="REDIS_HOST")
+    redis_port:     int       = Field(6379,        alias="REDIS_PORT")
+    redis_password: SecretStr = Field(...,         alias="REDIS_PASSWORD")
 
-    # ── Computed helpers ─────────────────────────────────────
+    # ── Computed helpers ──────────────────────────────────────
     @property
     def db_dsn(self) -> str:
         """asyncpg / psycopg2 connection string."""

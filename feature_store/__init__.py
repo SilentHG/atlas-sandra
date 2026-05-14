@@ -1,12 +1,8 @@
 """
 feature_store package
-=====================
-Technical indicator and ML feature computation for ATLAS.
-
-Modules
--------
-feature_engineer  – Computes 50+ features per symbol every 60 s
-                    and upserts them into the feature_store hypertable.
+======================
+- feature_engineer : FeatureEngineerAgent — computes 50+ technical features
+                     every 60 seconds and upserts to feature_store hypertable.
 """
 
 from feature_store.feature_engineer import FeatureEngineerAgent, run_feature_engineer

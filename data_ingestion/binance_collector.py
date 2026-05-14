@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
 from loguru import logger
 from tenacity import (
     AsyncRetrying,
@@ -178,8 +179,8 @@ async def run_binance_collector() -> None:
     async for attempt in AsyncRetrying(
         retry=retry_if_exception_type(
             (
-                websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.WebSocketException,
+                ConnectionClosed,
+                WebSocketException,
                 OSError,
                 asyncio.TimeoutError,
             )

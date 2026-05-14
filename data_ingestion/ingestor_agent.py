@@ -57,7 +57,7 @@ class DataIngestorAgent(BaseAgent):
 
     async def _fetch_polygon_bar(self, symbol: str) -> dict | None:
         """Fetch the latest 1-minute bar from Polygon REST API."""
-        api_key = settings.polygon_api_key.get_secret_value()
+        api_key = settings.polygon_api_key
         url = (
             f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev"
             f"?adjusted=true&apiKey={api_key}"

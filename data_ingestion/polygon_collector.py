@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
 from loguru import logger
 from tenacity import (
     AsyncRetrying,
@@ -229,7 +230,7 @@ async def run_polygon_collector() -> None:
     Uses tenacity for exponential back-off on any connection/protocol error.
     A PermissionError (bad API key) stops retrying immediately.
     """
-    api_key = settings.polygon_api_key.get_secret_value()
+    api_key = settings.polygon_api_key
     logger.info(
         "[polygon] Starting collector for symbols: {}", EQUITY_SYMBOLS
     )
@@ -240,8 +241,8 @@ async def run_polygon_collector() -> None:
     async for attempt in AsyncRetrying(
         retry=retry_if_exception_type(
             (
-                websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.WebSocketException,
+                ConnectionClosed,
+                WebSocketException,
                 OSError,
                 asyncio.TimeoutError,
             )
