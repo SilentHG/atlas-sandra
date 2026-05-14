@@ -31,9 +31,10 @@ import asyncio
 import json
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
+import httpx
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -73,6 +74,66 @@ async def _load_ohlcv(symbol: str, limit: int = LOOKBACK_BARS) -> pd.DataFrame:
     for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+async def _backfill_historical_data(symbol: str) -> None:
+    """Fetch 5 days of 1-minute OHLCV from Polygon if no data exists."""
+    count = await db.fetchval("SELECT COUNT(*) FROM market_data WHERE symbol = $1", symbol)
+    if count and count > 0:
+        return
+
+    logger.info("[feature_eng] No data for {}. Backfilling last 5 days from Polygon...", symbol)
+    
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=5)
+    
+    start_str = start_dt.strftime("%Y-%m-%d")
+    end_str = end_dt.strftime("%Y-%m-%d")
+    
+    ticker = symbol
+    if symbol in CRYPTO_SYMBOLS:
+        ticker = f"X:{symbol.replace('USDT', 'USD')}"
+        
+    api_key = settings.polygon_api_key
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/"
+        f"{start_str}/{end_str}?adjusted=true&sort=asc&limit=50000&apiKey={api_key}"
+    )
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            results = data.get("results", [])
+            if not results:
+                logger.warning("[feature_eng] Backfill returned no results for {}", symbol)
+                return
+                
+            rows = []
+            for r in results:
+                ts = datetime.fromtimestamp(r["t"] / 1000.0, tz=timezone.utc)
+                rows.append((
+                    symbol, ts,
+                    float(r["o"]), float(r["h"]), float(r["l"]), float(r["c"]),
+                    float(r["v"]), float(r.get("vw", 0.0)),
+                    int(r.get("n", 0)), "polygon_historical", "polygon_rest"
+                ))
+                
+            _INSERT_SQL = """
+                INSERT INTO market_data
+                    (symbol, timestamp, open, high, low, close, volume, vwap, num_trades, exchange, source)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (symbol, timestamp) DO NOTHING
+            """
+            pool = await db.get_pool()
+            async with pool.acquire() as conn:
+                await conn.executemany(_INSERT_SQL, rows)
+                
+            logger.success("[feature_eng] Backfilled {} rows for {}", len(rows), symbol)
+    except Exception as exc:
+        logger.error("[feature_eng] Failed to backfill {}: {}", symbol, exc)
 
 
 # ── Feature computation ────────────────────────────────────────────────────────
@@ -318,6 +379,10 @@ class FeatureEngineerAgent(BaseAgent):
     async def setup(self) -> None:
         await db.init_pool()
         logger.info("[feature_eng] DB pool ready")
+        
+        # Check and backfill missing data before starting cycle
+        for sym in self._symbols:
+            await _backfill_historical_data(sym)
 
     async def run(self) -> None:
         t0 = datetime.now(tz=timezone.utc)

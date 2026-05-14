@@ -88,9 +88,9 @@ class BaseAgent(ABC):
             await db.execute(
                 """
                 INSERT INTO agent_registry
-                    (agent_name, agent_type, config, status, last_heartbeat)
+                    (name, agent_type, config, status, last_heartbeat)
                 VALUES ($1, $2, $3::jsonb, 'idle', NOW())
-                ON CONFLICT (agent_name) DO UPDATE
+                ON CONFLICT (name) DO UPDATE
                     SET config         = EXCLUDED.config,
                         status         = 'idle',
                         updated_at     = NOW()
@@ -105,7 +105,7 @@ class BaseAgent(ABC):
     async def _update_status(self, status: str) -> None:
         try:
             await db.execute(
-                "UPDATE agent_registry SET status=$1, updated_at=NOW() WHERE agent_name=$2",
+                "UPDATE agent_registry SET status=$1, updated_at=NOW() WHERE name=$2",
                 status,
                 self.name,
             )
@@ -115,7 +115,7 @@ class BaseAgent(ABC):
     async def _send_heartbeat(self) -> None:
         try:
             await db.execute(
-                "UPDATE agent_registry SET last_heartbeat=NOW() WHERE agent_name=$1",
+                "UPDATE agent_registry SET last_heartbeat=NOW() WHERE name=$1",
                 self.name,
             )
         except Exception as exc:
@@ -130,7 +130,7 @@ class BaseAgent(ABC):
                        last_error  = $1,
                        status      = 'error',
                        updated_at  = NOW()
-                 WHERE agent_name  = $2
+                 WHERE name        = $2
                 """,
                 message[:500],
                 self.name,
