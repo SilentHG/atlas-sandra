@@ -278,7 +278,81 @@ def _compute_features(df: pd.DataFrame, symbol: str) -> dict[str, tuple[float, d
         cci     = (tp - tp_sma) / (0.015 * md.replace(0, np.nan))
         _safe(cci.iloc[-1], "cci_20", {"window": 20, "type": "CCI"})
 
-    # 14. Regime indicators
+    # 14. ADX-14
+    if n >= 15:
+        pc   = close.shift(1)
+        ph   = high.shift(1)
+        pl   = low.shift(1)
+        plus_dm  = (high - ph).clip(lower=0).where((high - ph) > (pl - low), 0)
+        minus_dm = (pl - low).clip(lower=0).where((pl - low) > (high - ph), 0)
+        tr       = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+        atr14    = tr.ewm(alpha=1/14, adjust=False).mean()
+        pdi = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        mdi = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        dx  = (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan) * 100
+        adx = dx.ewm(alpha=1/14, adjust=False).mean()
+        _safe(adx.iloc[-1], "adx_14",  {"window": 14, "type": "ADX"})
+        _safe(pdi.iloc[-1], "adx_pdi", {"window": 14, "type": "ADX_PDI"})
+        _safe(mdi.iloc[-1], "adx_mdi", {"window": 14, "type": "ADX_MDI"})
+
+    # 15. OBV (On Balance Volume)
+    direction = np.sign(close.diff().fillna(0))
+    obv = (volume * direction).cumsum()
+    _safe(obv.iloc[-1], "obv", {"type": "OBV"})
+    # OBV EMA signal (20-bar)
+    if n >= 20:
+        obv_ema = obv.ewm(span=20, adjust=False).mean()
+        _safe(obv_ema.iloc[-1],             "obv_ema_20",  {"window": 20, "type": "OBV_EMA"})
+        _safe(obv.iloc[-1] - obv_ema.iloc[-1], "obv_signal", {"type": "OBV_SIGNAL"})
+
+    # 16. Price ROC-20
+    if n > 20:
+        prev20 = close.iloc[-(21)]
+        if prev20 and prev20 != 0:
+            _safe((close.iloc[-1] - prev20) / prev20 * 100, "roc_20", {"window": 20, "type": "ROC"})
+
+    # 17. Volume SMA ratio (vol vs its own SMA-20)
+    if n >= 20:
+        vsma = volume.rolling(20).mean().iloc[-1]
+        if vsma and vsma > 0:
+            _safe(volume.iloc[-1] / vsma, "vol_sma_ratio_20", {"window": 20, "type": "VOL_SMA_RATIO"})
+
+    # 18. High-Low range (absolute + % of close)
+    hl_range = high.iloc[-1] - low.iloc[-1]
+    _safe(hl_range, "hl_range", {"type": "HL_RANGE"})
+    if close.iloc[-1] and close.iloc[-1] != 0:
+        _safe(hl_range / close.iloc[-1] * 100, "hl_range_pct", {"type": "HL_RANGE_PCT"})
+
+    # 19. Gap indicator (open vs prev close)
+    if n >= 2:
+        prev_close = close.iloc[-2]
+        cur_open   = df["open"].iloc[-1]
+        if prev_close and prev_close != 0:
+            gap_pct = (cur_open - prev_close) / prev_close * 100
+            _safe(gap_pct, "gap_pct", {"type": "GAP"})
+            _safe(1.0 if abs(gap_pct) > 0.5 else 0.0, "gap_flag", {"type": "GAP_FLAG", "threshold": 0.5})
+
+    # 20. Regime score (-3 to +3 composite)
+    regime_pts = 0.0
+    regime_cnt = 0
+    if "regime_trend" in features:
+        regime_pts += features["regime_trend"][0]; regime_cnt += 1
+    if "golden_cross" in features:
+        regime_pts += features["golden_cross"][0]; regime_cnt += 1
+    if "rsi_14" in features:
+        rsi_val = features["rsi_14"][0]
+        regime_pts += (1.0 if rsi_val > 55 else -1.0 if rsi_val < 45 else 0.0)
+        regime_cnt += 1
+    if regime_cnt > 0:
+        _safe(regime_pts, "regime_score", {"type": "REGIME_SCORE", "components": regime_cnt})
+
+    # 21. BB position (already have bb_pct_b — add explicit band label)
+    if "bb_pct_b" in features:
+        bp_val = features["bb_pct_b"][0]
+        band = 2.0 if bp_val > 1.0 else -2.0 if bp_val < 0.0 else (1.0 if bp_val > 0.5 else -1.0 if bp_val < 0.5 else 0.0)
+        _safe(band, "bb_position", {"type": "BB_POSITION"})
+
+    # Regime indicators (trend/golden cross/vol) — moved here from old #14
     lc = float(close.iloc[-1])
     if n >= 50:
         s50 = float(close.rolling(50).mean().iloc[-1])

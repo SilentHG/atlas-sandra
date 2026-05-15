@@ -88,16 +88,16 @@ class BaseAgent(ABC):
             await db.execute(
                 """
                 INSERT INTO agent_registry
-                    (name, agent_type, config, status, last_heartbeat)
+                    (name, agent_type, metadata, status, last_heartbeat)
                 VALUES ($1, $2, $3::jsonb, 'idle', NOW())
                 ON CONFLICT (name) DO UPDATE
-                    SET config         = EXCLUDED.config,
+                    SET metadata       = EXCLUDED.metadata,
                         status         = 'idle',
                         updated_at     = NOW()
                 """,
                 self.name,
                 self.agent_type,
-                str(self.config).replace("'", '"'),
+                __import__('json').dumps(self.config),
             )
         except Exception as exc:
             logger.warning("[{}] Could not register in DB: {}", self.name, exc)
