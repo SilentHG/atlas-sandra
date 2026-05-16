@@ -1,20 +1,17 @@
 """
-ATLAS — Polygon.io WebSocket Collector
-=======================================
+ATLAS — Polygon.io WebSocket + REST Collector
+===============================================
 Streams real-time 1-minute OHLCV bars for US equities from Polygon.io
 and persists them to the TimescaleDB `market_data` hypertable.
 
-Supported symbols (Day 1): AAPL, MSFT, NVDA, TSLA, AMZN
+DATA-001 ZERO GAPS:
+  - WebSocket streaming for real-time bars
+  - REST backfill loop every 5 minutes to catch any missed bars
+  - After every bar saved, check if previous minute exists
+  - If gap found, immediately backfill from REST API
+  - Only store equities data between 09:30-16:00 ET
 
-WebSocket docs:
-  https://polygon.io/docs/stocks/ws_stocks_am
-
-Message flow:
-  1. Connect to wss://socket.polygon.io/stocks
-  2. Authenticate with API key
-  3. Subscribe to AM.* (per-minute OHLCV aggregates)
-  4. On each AM message → validate → INSERT market_data
-  5. On any error → exponential back-off → reconnect
+Supported symbols: AAPL, MSFT, NVDA, TSLA, AMZN
 
 Run standalone:
   python -m data_ingestion.polygon_collector
@@ -26,8 +23,13 @@ import asyncio
 import json
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone, timedelta
 from typing import Any
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -39,6 +41,7 @@ from tenacity import (
     stop_never,
     wait_exponential,
 )
+import httpx
 
 from config.settings import settings
 from database import connection as db
@@ -55,6 +58,82 @@ SUBSCRIBE_CHANNELS = [f"AM.{sym}" for sym in EQUITY_SYMBOLS]
 # Reconnect back-off: 1s → 2s → 4s … capped at 60s
 _BACKOFF = wait_exponential(multiplier=1, min=1, max=60)
 
+# REST backfill interval
+_BACKFILL_INTERVAL_S = 300  # 5 minutes
+
+# Market hours in ET
+MARKET_TZ = ZoneInfo("America/New_York")
+_MARKET_OPEN  = dtime(9, 30)
+_MARKET_CLOSE = dtime(16, 0)
+
+# Market hours in UTC (fixed offset for simplicity in filtering)
+# 09:30 ET = 13:30 UTC (EST+5) or 14:30 UTC (EDT+4)
+# We use the timezone-aware approach instead of hardcoded UTC offsets
+
+# ── Market-hours gate ──────────────────────────────────────────────────────────
+
+
+def _is_market_hours_ts(ts: datetime) -> bool:
+    """
+    Return True if the given timestamp falls within NYSE market hours
+    (9:30-16:00 ET, Mon-Fri).  Checks the BAR's timestamp, not current time.
+    """
+    try:
+        ts_et = ts.astimezone(MARKET_TZ)
+        if ts_et.weekday() >= 5:  # Sat=5, Sun=6
+            return False
+        t = ts_et.time().replace(second=0, microsecond=0)
+        return _MARKET_OPEN <= t < _MARKET_CLOSE
+    except Exception as exc:
+        logger.warning("[polygon] Market hours check failed for {}: {}", ts, exc)
+        return False
+
+
+def _is_market_open() -> bool:
+    """Return True if NYSE is currently open (9:30-16:00 ET, Mon-Fri)."""
+    now_et = datetime.now(tz=MARKET_TZ)
+    if now_et.weekday() >= 5:
+        return False
+    t = now_et.time().replace(second=0, microsecond=0)
+    return _MARKET_OPEN <= t < _MARKET_CLOSE
+
+
+def _yesterday_market_window() -> tuple[datetime, datetime]:
+    """Return yesterday's regular-market session as UTC datetimes."""
+    yesterday_et = datetime.now(tz=MARKET_TZ).date() - timedelta(days=1)
+    start_et = datetime.combine(yesterday_et, _MARKET_OPEN, tzinfo=MARKET_TZ)
+    end_et = datetime.combine(yesterday_et, _MARKET_CLOSE, tzinfo=MARKET_TZ)
+    return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+
+
+def _cap_rest_range_to_yesterday(
+    from_ts: datetime,
+    to_ts: datetime,
+) -> tuple[datetime, datetime] | None:
+    """
+    Polygon REST backfill is historical-only. Keep the URL date at yesterday
+    or earlier because requesting today's date returns 403 on the current plan.
+    """
+    yesterday_start, yesterday_end = _yesterday_market_window()
+
+    if from_ts.tzinfo is None:
+        from_ts = from_ts.replace(tzinfo=timezone.utc)
+    if to_ts.tzinfo is None:
+        to_ts = to_ts.replace(tzinfo=timezone.utc)
+
+    from_ts = from_ts.astimezone(timezone.utc)
+    to_ts = to_ts.astimezone(timezone.utc)
+
+    if from_ts >= yesterday_end:
+        from_ts = yesterday_start
+    if to_ts > yesterday_end:
+        to_ts = yesterday_end
+
+    if from_ts >= to_ts:
+        return None
+    return from_ts, to_ts
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -67,15 +146,8 @@ def _parse_am_message(msg: dict[str, Any]) -> dict[str, Any] | None:
       ev  – event type ("AM")
       sym – symbol
       v   – volume
-      av  – accumulated volume
-      op  – official open price
+      o   – open, c – close, h – high, l – low
       vw  – volume-weighted average price
-      o   – open
-      c   – close
-      h   – high
-      l   – low
-      a   – VWAP
-      z   – average trade size
       s   – start timestamp (ms)
       e   – end timestamp   (ms)
       n   – number of trades in window
@@ -103,46 +175,235 @@ def _parse_am_message(msg: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
+_UPSERT_SQL = """
+    INSERT INTO market_data
+        (symbol, timestamp, open, high, low, close,
+         volume, vwap, num_trades, exchange, source)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (symbol, timestamp) DO UPDATE
+        SET open       = EXCLUDED.open,
+            high       = EXCLUDED.high,
+            low        = EXCLUDED.low,
+            close      = EXCLUDED.close,
+            volume     = EXCLUDED.volume,
+            vwap       = EXCLUDED.vwap,
+            num_trades = EXCLUDED.num_trades,
+            ingested_at = NOW()
+"""
+
+
 async def _persist_bar(bar: dict[str, Any]) -> None:
     """Upsert a single OHLCV bar into market_data."""
-    await db.execute(
-        """
-        INSERT INTO market_data
-            (symbol, timestamp, open, high, low, close,
-             volume, vwap, num_trades, exchange, source)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-        ON CONFLICT (symbol, timestamp) DO UPDATE
-            SET open       = EXCLUDED.open,
-                high       = EXCLUDED.high,
-                low        = EXCLUDED.low,
-                close      = EXCLUDED.close,
-                volume     = EXCLUDED.volume,
-                vwap       = EXCLUDED.vwap,
-                num_trades = EXCLUDED.num_trades,
-                ingested_at = NOW()
-        """,
-        bar["symbol"],
-        bar["timestamp"],
-        bar["open"],
-        bar["high"],
-        bar["low"],
-        bar["close"],
-        bar["volume"],
-        bar["vwap"],
-        bar["num_trades"],
-        bar["exchange"],
-        bar["source"],
+    try:
+        await db.execute(
+            _UPSERT_SQL,
+            bar["symbol"],
+            bar["timestamp"],
+            bar["open"],
+            bar["high"],
+            bar["low"],
+            bar["close"],
+            bar["volume"],
+            bar["vwap"],
+            bar["num_trades"],
+            bar["exchange"],
+            bar["source"],
+        )
+        logger.info(
+            "[polygon] ✓ {} | {:%Y-%m-%d %H:%M} UTC | O={:.4f} H={:.4f} L={:.4f} C={:.4f} V={:.0f}",
+            bar["symbol"],
+            bar["timestamp"],
+            bar["open"],
+            bar["high"],
+            bar["low"],
+            bar["close"],
+            bar["volume"],
+        )
+    except Exception as exc:
+        logger.error("[polygon] DB write error for {}: {}", bar["symbol"], exc)
+        raise
+
+
+# ── Gap detection ─────────────────────────────────────────────────────────────
+
+
+async def _check_and_fill_gap(symbol: str, bar_ts: datetime, api_key: str) -> None:
+    """
+    After saving a bar, check if the previous minute's bar exists.
+    If missing and within market hours, immediately backfill from REST API.
+    Zero gaps tolerance.
+    """
+    try:
+        prev_minute = bar_ts - timedelta(minutes=1)
+
+        # Only check gaps within market hours
+        if not _is_market_hours_ts(prev_minute):
+            return
+
+        exists = await db.fetchval(
+            "SELECT 1 FROM market_data WHERE symbol=$1 AND timestamp=$2",
+            symbol, prev_minute,
+        )
+        if exists:
+            return
+
+        logger.warning(
+            "[polygon] GAP DETECTED: {} missing bar at {:%H:%M} UTC — backfilling",
+            symbol, prev_minute,
+        )
+        await _rest_backfill_range(
+            symbol, prev_minute, bar_ts, api_key,
+        )
+    except Exception as exc:
+        logger.error("[polygon] Gap check error for {} @ {}: {}", symbol, bar_ts, exc)
+
+
+async def _rest_backfill_range(
+    symbol: str,
+    from_ts: datetime,
+    to_ts: datetime,
+    api_key: str,
+) -> int:
+    """
+    Fetch 1-minute bars from Polygon REST API for a specific time range.
+    Returns count of bars inserted.
+    """
+    if _is_market_open():
+        logger.info(
+            "[polygon] Market open — skipping REST backfill for {}; WebSocket handles live data",
+            symbol,
+        )
+        return 0
+
+    capped_range = _cap_rest_range_to_yesterday(from_ts, to_ts)
+    if capped_range is None:
+        logger.info(
+            "[polygon] REST backfill skipped for {}; requested range is not historical: {} → {}",
+            symbol,
+            from_ts,
+            to_ts,
+        )
+        return 0
+
+    from_ts, to_ts = capped_range
+    from_str = from_ts.strftime("%Y-%m-%d")
+    to_str = to_ts.strftime("%Y-%m-%d")
+
+    # Use millisecond timestamps for precise range
+    from_ms = int(from_ts.timestamp() * 1000)
+    to_ms = int(to_ts.timestamp() * 1000)
+
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/"
+        f"{from_str}/{to_str}"
+        f"?adjusted=true&sort=asc&limit=50000&apiKey={api_key}"
     )
-    logger.info(
-        "[polygon] ✓ {} | {:%Y-%m-%d %H:%M} UTC | O={:.4f} H={:.4f} L={:.4f} C={:.4f} V={:.0f}",
-        bar["symbol"],
-        bar["timestamp"],
-        bar["open"],
-        bar["high"],
-        bar["low"],
-        bar["close"],
-        bar["volume"],
-    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+
+        if not results:
+            logger.debug("[polygon] REST backfill: no results for {} ({} → {})", symbol, from_ts, to_ts)
+            return 0
+
+        count = 0
+        for r in results:
+            bar_ts = datetime.fromtimestamp(r["t"] / 1000.0, tz=timezone.utc)
+
+            # Only store bars within market hours
+            if not _is_market_hours_ts(bar_ts):
+                continue
+
+            bar = {
+                "symbol":     symbol,
+                "timestamp":  bar_ts,
+                "open":       float(r["o"]),
+                "high":       float(r["h"]),
+                "low":        float(r["l"]),
+                "close":      float(r["c"]),
+                "volume":     float(r["v"]),
+                "vwap":       float(r.get("vw", 0.0)),
+                "num_trades": int(r.get("n", 0)),
+                "exchange":   "polygon_rest",
+                "source":     "polygon_rest",
+            }
+            try:
+                await _persist_bar(bar)
+                count += 1
+            except Exception as exc:
+                logger.error("[polygon] REST backfill persist error: {}", exc)
+
+        if count > 0:
+            logger.success("[polygon] REST backfill: {} bars filled for {}", count, symbol)
+        return count
+
+    except Exception as exc:
+        logger.error("[polygon] REST backfill failed for {}: {}", symbol, exc)
+        return 0
+
+
+# ── Periodic REST backfill loop ───────────────────────────────────────────────
+
+
+async def _periodic_backfill_loop(api_key: str) -> None:
+    """
+    Every 5 minutes while the market is closed, check yesterday's session for
+    historical gaps and backfill from REST API. Live gaps during market hours
+    are handled by the WebSocket stream.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_BACKFILL_INTERVAL_S)
+
+            if _is_market_open():
+                logger.debug("[polygon] Market open — skipping REST backfill")
+                continue
+
+            logger.info("[polygon] Running historical REST backfill check for yesterday …")
+            from_ts, to_ts = _yesterday_market_window()
+
+            for symbol in EQUITY_SYMBOLS:
+                try:
+                    # Find gaps: minutes where we should have data but don't
+                    rows = await db.fetch(
+                        """
+                        SELECT timestamp FROM market_data
+                        WHERE symbol = $1 AND timestamp >= $2 AND timestamp <= $3
+                        ORDER BY timestamp ASC
+                        """,
+                        symbol, from_ts, to_ts,
+                    )
+
+                    existing_ts = {row["timestamp"] for row in rows}
+
+                    # Generate expected timestamps (every minute during market hours)
+                    check_ts = from_ts.replace(second=0, microsecond=0)
+                    gaps = []
+                    while check_ts < to_ts:
+                        if _is_market_hours_ts(check_ts) and check_ts not in existing_ts:
+                            gaps.append(check_ts)
+                        check_ts += timedelta(minutes=1)
+
+                    if gaps:
+                        logger.warning(
+                            "[polygon] Found {} historical gaps for {} yesterday — backfilling",
+                            len(gaps), symbol,
+                        )
+                        await _rest_backfill_range(symbol, gaps[0], gaps[-1] + timedelta(minutes=1), api_key)
+                    else:
+                        logger.debug("[polygon] No gaps for {} in last 10 min ✓", symbol)
+
+                except Exception as exc:
+                    logger.error("[polygon] Periodic backfill error for {}: {}", symbol, exc)
+
+        except asyncio.CancelledError:
+            logger.info("[polygon] Periodic backfill loop cancelled")
+            break
+        except Exception as exc:
+            logger.error("[polygon] Periodic backfill loop error: {}", exc)
 
 
 # ── Core WebSocket session ────────────────────────────────────────────────────
@@ -161,7 +422,7 @@ async def _run_session(api_key: str) -> None:
         ping_interval=20,
         ping_timeout=20,
         close_timeout=10,
-        max_size=10 * 1024 * 1024,   # 10 MB – avoids frame-size errors
+        max_size=10 * 1024 * 1024,   # 10 MB
     ) as ws:
         # ── Step 1: receive connection banner ────────────────────────────────
         raw = await ws.recv()
@@ -192,33 +453,58 @@ async def _run_session(api_key: str) -> None:
         await ws.send(subscribe_msg)
         logger.info("[polygon] Subscribed to: {}", SUBSCRIBE_CHANNELS)
 
-        # ── Step 4: consume messages ─────────────────────────────────────────
-        async for raw_msg in ws:
+        # ── Step 4: start periodic backfill alongside WebSocket ──────────────
+        backfill_task = asyncio.create_task(_periodic_backfill_loop(api_key))
+
+        try:
+            # ── Step 5: consume messages ─────────────────────────────────────
+            async for raw_msg in ws:
+                try:
+                    messages = json.loads(raw_msg)
+                except json.JSONDecodeError as exc:
+                    logger.warning("[polygon] JSON decode error: {}", exc)
+                    continue
+
+                if not isinstance(messages, list):
+                    messages = [messages]
+
+                for msg in messages:
+                    ev = msg.get("ev")
+
+                    if ev == "AM":
+                        bar = _parse_am_message(msg)
+                        if bar:
+                            # Filter on BAR timestamp, not current time
+                            if _is_market_hours_ts(bar["timestamp"]):
+                                try:
+                                    await _persist_bar(bar)
+                                    # Gap detection: check previous minute
+                                    asyncio.create_task(
+                                        _check_and_fill_gap(
+                                            bar["symbol"],
+                                            bar["timestamp"],
+                                            api_key,
+                                        )
+                                    )
+                                except Exception as db_exc:
+                                    logger.error("[polygon] DB write error: {}", db_exc)
+                            else:
+                                logger.debug(
+                                    "[polygon] Outside market hours — discarding {} bar @ {}",
+                                    bar["symbol"], bar["timestamp"],
+                                )
+
+                    elif ev == "status":
+                        logger.debug("[polygon] status: {}", msg)
+
+                    else:
+                        logger.trace("[polygon] unhandled ev='{}': {}", ev, msg)
+        finally:
+            backfill_task.cancel()
             try:
-                messages = json.loads(raw_msg)
-            except json.JSONDecodeError as exc:
-                logger.warning("[polygon] JSON decode error: {}", exc)
-                continue
-
-            if not isinstance(messages, list):
-                messages = [messages]
-
-            for msg in messages:
-                ev = msg.get("ev")
-
-                if ev == "AM":
-                    bar = _parse_am_message(msg)
-                    if bar:
-                        try:
-                            await _persist_bar(bar)
-                        except Exception as db_exc:
-                            logger.error("[polygon] DB write error: {}", db_exc)
-
-                elif ev == "status":
-                    logger.debug("[polygon] status: {}", msg)
-
-                else:
-                    logger.trace("[polygon] unhandled ev='{}': {}", ev, msg)
+                await backfill_task
+            except asyncio.CancelledError:
+                pass
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -237,6 +523,20 @@ async def run_polygon_collector() -> None:
 
     # Initialise DB pool once
     await db.init_pool()
+
+    # Run initial historical backfill to fill any existing gaps
+    logger.info("[polygon] Running initial REST backfill for yesterday …")
+    from_ts, to_ts = _yesterday_market_window()
+    for symbol in EQUITY_SYMBOLS:
+        try:
+            await _rest_backfill_range(
+                symbol,
+                from_ts,
+                to_ts,
+                api_key,
+            )
+        except Exception as exc:
+            logger.error("[polygon] Initial backfill failed for {}: {}", symbol, exc)
 
     async for attempt in AsyncRetrying(
         retry=retry_if_exception_type(
@@ -261,9 +561,6 @@ async def run_polygon_collector() -> None:
                     "Check POLYGON_API_KEY in config/keys.env"
                 )
                 raise  # bubble up — do not retry
-
-    # Should never reach here (stop=stop_never), but log just in case
-    logger.warning("[polygon] Collector exited retry loop unexpectedly")
 
 
 # ── CLI entrypoint ────────────────────────────────────────────────────────────

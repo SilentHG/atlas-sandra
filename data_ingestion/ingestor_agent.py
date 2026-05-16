@@ -6,8 +6,8 @@ Orchestrates the data ingestion layer. Delegates to:
   - data_ingestion.binance_collector  (Binance WebSocket)
   - data_ingestion.alpaca_connector   (Alpaca order management)
 
-This stub runs a lightweight REST-based poll for backwards compatibility.
-For production use, launch the WebSocket collectors directly.
+This compatibility agent runs a lightweight REST-based poll.
+For continuous production feeds, launch the WebSocket collectors directly.
 """
 
 from __future__ import annotations

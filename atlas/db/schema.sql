@@ -1,0 +1,1 @@
+\i ../../database/schema.sql

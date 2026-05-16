@@ -50,10 +50,14 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     For every strategy you output a single, valid JSON object with exactly these keys:
       name           : str   – short unique strategy name (snake_case)
       description    : str   – 2-3 sentence plain-English description
+      rationale      : str   – plain English explanation of WHY this strategy works
+      asset_class    : str   – "equity" or "crypto" or "multi_asset"
       symbols        : list  – list of 2-5 US equity ticker symbols (e.g. ["AAPL","MSFT"])
       timeframe      : str   – bar size e.g. "1m", "5m", "1h"
-      entry_rules    : dict  – mapping of rule_name → human-readable condition
-      exit_rules     : dict  – mapping of rule_name → human-readable condition
+      entry_rules    : dict  – mapping of rule_name → human-readable condition (MINIMUM 2 rules)
+      exit_rules     : dict  – mapping of rule_name → human-readable condition (MINIMUM 2 rules)
+      position_sizing: dict  – keys: method (str), parameters (dict with risk_pct, max_pct)
+      risk_parameters: dict  – keys: stop_loss (dict), take_profit (dict), max_drawdown (float 0-1)
       stop_loss      : dict  – keys: method (str), pct (float 0-1), atr_multiple (float)
       position_size  : dict  – keys: method (str), risk_pct (float 0-1), max_pct (float 0-1)
       regime_filter  : dict  – keys: required_trend (str: "bullish"|"bearish"|"any"),
@@ -66,11 +70,10 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 _USER_PROMPTS: list[str] = [
-    # Strategy 1 — momentum / trend-following
+    # 1 — Momentum trend-following
     textwrap.dedent("""\
         Design a momentum trend-following strategy for large-cap US tech equities
         (choose 3–5 symbols from AAPL, MSFT, NVDA, TSLA, AMZN, GOOGL, META).
-
         Requirements:
         - Enter long when price crosses above both EMA-9 and EMA-21 with RSI-14 between 50–70
         - Use MACD histogram turning positive as confirmation
@@ -79,18 +82,114 @@ _USER_PROMPTS: list[str] = [
         - Only trade when the daily regime is bullish (price > SMA-200)
         - Position size: fixed fractional, risk 1% of capital per trade
     """),
-    # Strategy 2 — mean-reversion
+    # 2 — Mean-reversion Bollinger
     textwrap.dedent("""\
         Design a mean-reversion strategy for US equities using Bollinger Bands.
-
         Requirements:
-        - Enter long when %B drops below 0.1 (close near lower band) AND RSI-14 < 35
-        - Confirm with Williams %R < -85 (oversold)
+        - Enter long when %B drops below 0.1 AND RSI-14 < 35
+        - Confirm with Williams %R < -85
         - Exit when %B crosses above 0.5 OR RSI-14 > 60
         - Stop-loss: 2% hard stop below entry
-        - Only trade when CCI-20 shows the market is not in a strong trend (|CCI| < 100)
-        - Position size: Kelly criterion with max 5% of portfolio per position
-        - Choose 3–5 symbols from SP500 liquid names: AAPL, JPM, V, JNJ, PG, KO
+        - Only trade when CCI-20 shows |CCI| < 100
+        - Position size: Kelly criterion max 5% per position
+        - Choose symbols from: AAPL, JPM, V, JNJ, PG, KO
+    """),
+    # 3 — Breakout
+    textwrap.dedent("""\
+        Design a breakout strategy that enters when price closes above the 20-day high
+        with volume > 2× its 20-day average.
+        Requirements:
+        - Entry: close > highest(close, 20) AND rel_volume_20 > 2.0
+        - Confirm with ADX-14 > 25 (trending market)
+        - Exit: trailing stop at 2× ATR-14 below the highest close since entry
+        - Stop-loss: 1× ATR-14 below breakout level
+        - Regime: bullish only (SMA-50 > SMA-200)
+        - Position size: risk 1.5% of capital per trade
+        - Choose 3–5 symbols from: AAPL, MSFT, NVDA, AMZN, META
+    """),
+    # 4 — RSI divergence
+    textwrap.dedent("""\
+        Design an RSI divergence strategy for US equities.
+        Requirements:
+        - Enter long when price makes a lower low but RSI-14 makes a higher low (bullish divergence)
+        - Confirm: stochastic %K crosses above %D from below 20
+        - Exit: RSI > 65 or price hits take-profit at 2× risk
+        - Stop-loss: below the recent swing low, max 1.5%
+        - Regime: any regime, but skip if ADX > 50 (extreme trend)
+        - Position size: 1% risk per trade
+        - Choose symbols from: TSLA, NVDA, AMD, AMZN, GOOGL
+    """),
+    # 5 — VWAP reversion
+    textwrap.dedent("""\
+        Design a VWAP reversion strategy for intraday trading of US equities.
+        Requirements:
+        - Enter long when price dips > 1% below VWAP AND RSI-7 < 30
+        - Enter short when price rises > 1% above VWAP AND RSI-7 > 70
+        - Exit: price returns to VWAP or 0.5× ATR profit target
+        - Stop-loss: 0.5% beyond entry
+        - Regime: ranging market (ADX < 20)
+        - Position size: 0.5% risk per trade (tight stops)
+        - Choose 3 highly liquid symbols: AAPL, MSFT, AMZN
+    """),
+    # 6 — Golden cross momentum
+    textwrap.dedent("""\
+        Design a golden cross momentum strategy.
+        Requirements:
+        - Enter long when SMA-50 crosses above SMA-200 AND MACD line > signal line
+        - Confirm: volume on crossover day > 1.5× average
+        - Exit: SMA-50 crosses below SMA-200 OR MACD histogram turns negative for 3 bars
+        - Stop-loss: 3× ATR-14 (wide stop for swing trades)
+        - Regime: any
+        - Position size: 2% risk per trade, max 10% per position
+        - Symbols: AAPL, MSFT, GOOGL, V, UNH
+    """),
+    # 7 — Stochastic oversold bounce
+    textwrap.dedent("""\
+        Design a stochastic oversold bounce strategy.
+        Requirements:
+        - Enter long when stoch %K < 20, %D < 20, and %K crosses above %D
+        - Confirm: price is above SMA-200 (long-term uptrend intact)
+        - Exit: stoch %K > 80 OR RSI-14 > 70
+        - Stop-loss: 1.5% below entry
+        - Regime: bullish (price > SMA-50)
+        - Position size: 1% risk per trade
+        - Symbols: JPM, BAC, GS, MS, WFC
+    """),
+    # 8 — CCI trend-pull
+    textwrap.dedent("""\
+        Design a CCI trend-pull strategy.
+        Requirements:
+        - Enter long when CCI-20 crosses above +100 from below (trend beginning)
+        - Confirm: EMA-9 > EMA-21 AND volume above average
+        - Exit: CCI drops below +100 OR price < EMA-21
+        - Stop-loss: 2× ATR-14
+        - Regime: trending (ADX > 20)
+        - Position size: 1.5% risk per trade
+        - Symbols: NVDA, TSLA, AMD, AVGO, QCOM
+    """),
+    # 9 — Williams %R momentum
+    textwrap.dedent("""\
+        Design a Williams %R momentum strategy.
+        Requirements:
+        - Enter long when Williams %R crosses above -50 from below -80 (leaving oversold)
+        - Confirm: MACD histogram positive AND price > SMA-20
+        - Exit: Williams %R > -20 (overbought) OR trailing stop hit
+        - Stop-loss: 1× ATR-14
+        - Regime: bullish (price > SMA-100)
+        - Position size: 1% risk
+        - Symbols: AAPL, MSFT, AMZN, GOOGL, META
+    """),
+    # 10 — OBV divergence
+    textwrap.dedent("""\
+        Design an OBV (On Balance Volume) divergence strategy.
+        Requirements:
+        - Enter long when price makes a lower low but OBV makes a higher low
+        - Confirm: RSI-14 < 40 (room to run upward)
+        - Exit: OBV diverges bearishly OR RSI > 70
+        - Stop-loss: 2% below entry
+        - Regime: any, but prefer ranging (ADX < 25)
+        - Position size: 1% risk, max 5% per position
+        - Symbols: PG, KO, PEP, WMT, COST
     """),
 ]
 
@@ -114,7 +213,7 @@ def _get_claude_client() -> anthropic.Anthropic:
 async def _generate_spec(
     client: anthropic.Anthropic,
     user_prompt: str,
-    model: str = "claude-opus-4-5",
+    model: str = "claude-sonnet-4-20250514",
     max_tokens: int = 2048,
 ) -> dict[str, Any]:
     """
@@ -151,10 +250,37 @@ async def _generate_spec(
         "name", "description", "symbols", "timeframe",
         "entry_rules", "exit_rules", "stop_loss",
         "position_size", "regime_filter", "parameters", "strategy_type",
+        "rationale", "asset_class", "risk_parameters",
     }
     missing = required - set(spec.keys())
     if missing:
-        raise ValueError(f"Generated spec missing keys: {missing}")
+        # Try to auto-fill optional fields with defaults
+        if "rationale" in missing:
+            spec["rationale"] = spec.get("description", "Auto-generated strategy")
+            missing.discard("rationale")
+        if "asset_class" in missing:
+            spec["asset_class"] = "equity"
+            missing.discard("asset_class")
+        if "risk_parameters" in missing:
+            spec["risk_parameters"] = {
+                "stop_loss": spec.get("stop_loss", {}),
+                "take_profit": {"method": "fixed", "pct": 0.04},
+                "max_drawdown": 0.10,
+            }
+            missing.discard("risk_parameters")
+        if "position_sizing" in missing:
+            spec["position_sizing"] = spec.get("position_size", {})
+            missing.discard("position_sizing")
+        if missing:
+            raise ValueError(f"Generated spec missing keys: {missing}")
+
+    # Enforce minimum 2 entry rules and 2 exit rules
+    entry_rules = spec.get("entry_rules", {})
+    exit_rules = spec.get("exit_rules", {})
+    if isinstance(entry_rules, dict) and len(entry_rules) < 2:
+        raise ValueError(f"entry_rules must have at least 2 conditions, got {len(entry_rules)}")
+    if isinstance(exit_rules, dict) and len(exit_rules) < 2:
+        raise ValueError(f"exit_rules must have at least 2 conditions, got {len(exit_rules)}")
 
     return spec
 
@@ -196,11 +322,15 @@ async def _save_strategy(spec: dict[str, Any]) -> str:
 
     # Pack the full spec into parameters for downstream use
     params = {
-        "entry_rules":   spec.get("entry_rules", {}),
-        "exit_rules":    spec.get("exit_rules",  {}),
-        "stop_loss":     spec.get("stop_loss",   {}),
-        "position_size": spec.get("position_size", {}),
-        "regime_filter": spec.get("regime_filter", {}),
+        "entry_rules":     spec.get("entry_rules", {}),
+        "exit_rules":      spec.get("exit_rules",  {}),
+        "stop_loss":       spec.get("stop_loss",   {}),
+        "position_size":   spec.get("position_size", {}),
+        "position_sizing": spec.get("position_sizing", spec.get("position_size", {})),
+        "regime_filter":   spec.get("regime_filter", {}),
+        "risk_parameters": spec.get("risk_parameters", {}),
+        "rationale":       spec.get("rationale", ""),
+        "asset_class":     spec.get("asset_class", "equity"),
         **spec.get("parameters", {}),
     }
 
@@ -235,8 +365,8 @@ async def _save_strategy(spec: dict[str, Any]) -> str:
 
 
 async def run_ideator(
-    n: int = 2,
-    model: str = "claude-opus-4-5",
+    n: int = 10,
+    model: str = "claude-sonnet-4-20250514",
 ) -> list[str]:
     """
     Generate `n` strategy specs via Claude and save them to the DB.
@@ -255,7 +385,8 @@ async def run_ideator(
     """
     await db.init_pool()
     client = _get_claude_client()
-    prompts = _USER_PROMPTS[:n]   # use first n built-in prompts
+    # Cycle through prompts if n > len(_USER_PROMPTS)
+    prompts = [_USER_PROMPTS[i % len(_USER_PROMPTS)] for i in range(n)]
 
     saved_ids: list[str] = []
     for idx, prompt in enumerate(prompts, start=1):
@@ -293,11 +424,11 @@ async def _main() -> None:
             "<cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>"
         ),
     )
-    ids = await run_ideator(n=2)
+    ids = await run_ideator(n=10)
     if ids:
-        print(f"\n✅  {len(ids)} strategies generated and saved:\n" + "\n".join(f"  • {i}" for i in ids))
+        print(f"\n[OK] {len(ids)} strategies generated and saved:\n" + "\n".join(f"  - {i}" for i in ids))
     else:
-        print("\n❌  No strategies were saved — check logs above.")
+        print("\n[FAIL] No strategies were saved -- check logs above.")
 
 
 if __name__ == "__main__":

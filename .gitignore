@@ -27,6 +27,11 @@ build/
 *.egg-info/
 .eggs/
 
+# ── Next.js dashboard ─────────────────────────────────────────
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+
 # ── Test / Coverage ───────────────────────────────────────────
 .pytest_cache/
 .coverage

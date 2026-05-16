@@ -1,0 +1,84 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: always
+    environment:
+      POSTGRES_DB: ${TIMESCALEDB_DB:-atlas}
+      POSTGRES_USER: ${TIMESCALEDB_USER:-atlas_user}
+      POSTGRES_PASSWORD: ${TIMESCALEDB_PASSWORD:-atlas_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: always
+    env_file:
+      - ./config/keys.env
+    environment:
+      TIMESCALEDB_HOST: timescaledb
+    ports:
+      - "8080:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  polygon-ingestion:
+    build: .
+    restart: always
+    command: ["python", "-m", "data_ingestion.polygon_collector"]
+    env_file:
+      - ./config/keys.env
+    environment:
+      TIMESCALEDB_HOST: timescaledb
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  binance-ingestion:
+    build: .
+    restart: always
+    command: ["python", "-m", "data_ingestion.binance_collector"]
+    env_file:
+      - ./config/keys.env
+    environment:
+      TIMESCALEDB_HOST: timescaledb
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  feature-engineer:
+    build: .
+    restart: always
+    command: ["python", "-m", "feature_store.feature_engineer"]
+    env_file:
+      - ./config/keys.env
+    environment:
+      TIMESCALEDB_HOST: timescaledb
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  dashboard:
+    image: node:20-alpine
+    restart: always
+    working_dir: /app
+    command: ["sh", "-c", "npm install && npm run dev -- --hostname 0.0.0.0"]
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://api:8080
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./dashboard:/app
+    depends_on:
+      - api
+
+volumes:
+  timescale_data:

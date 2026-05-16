@@ -52,7 +52,7 @@ logger.add(
 # ── Watchlist ─────────────────────────────────────────────────────────────────
 
 EQUITY_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
-CRYPTO_WATCHLIST = ["BTCUSDT", "ETHUSDT"]
+CRYPTO_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 FULL_WATCHLIST   = EQUITY_WATCHLIST + CRYPTO_WATCHLIST
 
 
@@ -82,7 +82,7 @@ async def _bootstrap_strategies() -> None:
     logger.info("[main] No active strategies found — running ideator …")
     try:
         from strategy_engine.ideator import run_ideator
-        ids = await run_ideator(n=2)
+        ids = await run_ideator(n=10)
         if ids:
             logger.info("[main] Ideator created {} draft strategies.", len(ids))
         else:
@@ -114,6 +114,11 @@ async def main(skip_ideate: bool = False) -> None:
     # 1. Database pool
     await init_pool()
     logger.info("[main] Database pool initialised.")
+
+    # 1b. Kill switch setup (restore state from DB)
+    from risk_management.kill_switch import get_kill_switch
+    ks = get_kill_switch()
+    await ks.setup()
 
     # 2. Strategy bootstrap (ideate + code if no active strategies)
     if not skip_ideate:

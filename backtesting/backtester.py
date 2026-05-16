@@ -75,11 +75,11 @@ class Backtester:
     async def _load_data(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
         rows = await db.fetch(
             """
-            SELECT time, open, high, low, close, volume
+            SELECT timestamp, open, high, low, close, volume
               FROM market_data
              WHERE symbol = $1
-               AND time BETWEEN $2 AND $3
-             ORDER BY time ASC
+               AND timestamp BETWEEN $2 AND $3
+             ORDER BY timestamp ASC
             """,
             symbol, start, end,
         )

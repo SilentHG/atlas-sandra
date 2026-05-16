@@ -205,11 +205,10 @@ CREATE TABLE IF NOT EXISTS orders (
     avg_fill_price  DOUBLE PRECISION,
 
     -- ── Status ────────────────────────────────────────────
-    -- pending | submitted | partial | filled | cancelled | rejected | expired
     status          TEXT             NOT NULL DEFAULT 'pending'
                                      CHECK (status IN
                                         ('pending','submitted','partial',
-                                         'filled','cancelled','rejected','expired')),
+                                         'filled','cancelled','rejected','expired','accepted','new')),
     -- ── Exchange linkage ──────────────────────────────────
     exchange        TEXT             NOT NULL DEFAULT 'alpaca',
     client_order_id TEXT             UNIQUE,
@@ -227,14 +226,8 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at      TIMESTAMPTZ      NOT NULL DEFAULT NOW()
 );
 
--- Hypertable on filled_at (NULLable) — use created_at as the partition key
--- so all rows are valid even before filling.
-SELECT create_hypertable(
-    'orders', 'created_at',
-    chunk_time_interval => INTERVAL '7 days',
-    if_not_exists       => TRUE,
-    migrate_data        => TRUE
-);
+-- Orders is a standard table to support UNIQUE(client_order_id) without
+-- requiring partition keys in every constraint.
 
 CREATE INDEX IF NOT EXISTS idx_orders_symbol_created
     ON orders (symbol, created_at DESC);
@@ -346,7 +339,65 @@ CREATE INDEX IF NOT EXISTS idx_agent_registry_type
     ON agent_registry (agent_type, status);
 
 -- ============================================================
--- 8. AGENT LOGS  (bonus — required by BaseAgent)
+-- 8. KILL SWITCH STATE
+--    Persistent global and per-strategy trading halts.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS kill_switch_state (
+    id              TEXT        PRIMARY KEY DEFAULT 'global',
+    armed           BOOLEAN     NOT NULL DEFAULT FALSE,
+    reason          TEXT,
+    armed_at        TIMESTAMPTZ,
+    armed_by        TEXT,
+    daily_loss_usd  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    weekly_loss_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    capital         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    scope           TEXT        NOT NULL DEFAULT 'portfolio',
+    strategy_id     UUID,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO kill_switch_state (id, armed, scope)
+VALUES ('global', FALSE, 'portfolio')
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS strategy_kill_state (
+    strategy_id     TEXT        PRIMARY KEY,
+    armed           BOOLEAN     NOT NULL DEFAULT FALSE,
+    reason          TEXT,
+    armed_at        TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_kill_armed
+    ON strategy_kill_state (armed, updated_at DESC);
+
+-- ============================================================
+-- 9. RISK SNAPSHOTS
+--    Point-in-time risk telemetry for API/dashboard checks.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS risk_snapshots (
+    timestamp          TIMESTAMPTZ      NOT NULL,
+    capital            DOUBLE PRECISION NOT NULL,
+    peak_capital       DOUBLE PRECISION NOT NULL,
+    drawdown_pct       DOUBLE PRECISION NOT NULL,
+    daily_pnl          DOUBLE PRECISION NOT NULL,
+    daily_loss         DOUBLE PRECISION NOT NULL,
+    daily_loss_cap_usd DOUBLE PRECISION NOT NULL,
+    trade_count        INTEGER          NOT NULL,
+    kill_switch        BOOLEAN          NOT NULL DEFAULT FALSE
+);
+
+SELECT create_hypertable(
+    'risk_snapshots', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists       => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_risk_snapshots_time
+    ON risk_snapshots (timestamp DESC);
+
+-- ============================================================
+-- 10. AGENT LOGS  (bonus — required by BaseAgent)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS agent_logs (
     time            TIMESTAMPTZ      NOT NULL DEFAULT NOW(),

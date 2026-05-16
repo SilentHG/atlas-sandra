@@ -1,14 +1,18 @@
 """
 ATLAS Base Strategy
 ====================
-Abstract base for all trading strategies.
-Concrete strategies override `generate_signal()`.
+Base contract for all trading strategies.
+Concrete strategies can override the full vectorized interface:
+  - generate_signals(data) -> pd.Series
+  - compute_position_size(signal, portfolio_value) -> float
+  - check_filters(data) -> bool
+  - get_metadata() -> dict
 """
 
 from __future__ import annotations
 
 import uuid
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -38,7 +42,15 @@ class TradeSignal:
 
 
 class BaseStrategy(ABC):
-    """Abstract base class for all ATLAS strategies."""
+    """Base class for all ATLAS strategies.
+
+    ATLAS supports two strategy contracts:
+    - the current vectorized ``generate_signals`` method used by generated code
+    - the legacy single-symbol ``generate_signal`` method used by earlier tests
+
+    The default implementations bridge those contracts so older strategies keep
+    running while new generated strategies can override the richer methods.
+    """
 
     strategy_type: str = "base"
 
@@ -50,12 +62,70 @@ class BaseStrategy(ABC):
         self.is_active  = False
         self.is_paper   = True
 
-    @abstractmethod
-    def generate_signal(self, symbol: str, features: pd.DataFrame) -> TradeSignal:
+    # ── Strategy interface (GEN-001, GEN-002, GEN-003) ───────────────────────
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
         """
         Given a DataFrame of OHLCV + features (latest row = most recent),
-        return a TradeSignal.
+        return a pd.Series of Signal values (BUY, SELL, HOLD, CLOSE).
         """
+        if data.empty:
+            return pd.Series(dtype=object)
+
+        signals: list[Signal] = []
+        for idx in range(len(data)):
+            window = data.iloc[: idx + 1]
+            symbol = self.symbols[0] if self.symbols else ""
+            signals.append(self.generate_signal(symbol, window).signal)
+        return pd.Series(signals, index=data.index)
+
+    def compute_position_size(self, signal: Any, portfolio_value: float) -> float:
+        """
+        Given a signal and current portfolio value, return the number of
+        shares/units to trade.
+        """
+        risk_pct = float(self.parameters.get("risk_pct", self.parameters.get("risk_per_trade", 0.01)))
+        entry_price = getattr(signal, "entry_price", None) or self.parameters.get("entry_price")
+        if not entry_price or entry_price <= 0:
+            return 0.0
+        return max((portfolio_value * risk_pct) / float(entry_price), 0.0)
+
+    def check_filters(self, data: pd.DataFrame) -> bool:
+        """
+        Return True if regime/market filters pass and trading is allowed.
+        """
+        return not data.empty
+
+    def get_metadata(self) -> dict:
+        """
+        Return a dict with: name, version, description, strategy_type, symbols, parameters.
+        """
+        return {
+            "name": self.name,
+            "version": str(self.parameters.get("version", "1.0.0")),
+            "description": self.parameters.get("description", self.name),
+            "strategy_type": self.strategy_type,
+            "symbols": self.symbols,
+            "parameters": self.parameters,
+        }
+
+    # ── Legacy compatibility ─────────────────────────────────────────────────
+
+    def generate_signal(self, symbol: str, features: pd.DataFrame) -> TradeSignal:
+        """
+        Legacy method for backwards compatibility.
+        Calls generate_signals() and wraps result in a TradeSignal.
+        """
+        signals = self.generate_signals(features)
+        last_signal = signals.iloc[-1] if not signals.empty else Signal.HOLD
+        if isinstance(last_signal, str):
+            last_signal = Signal(last_signal)
+        return TradeSignal(
+            strategy_id=self.id,
+            strategy_name=self.name,
+            symbol=symbol,
+            signal=last_signal,
+        )
 
     def validate(self) -> bool:
         """Override to add parameter validation logic."""

@@ -1,0 +1,75 @@
+name: ATLAS CI
+
+on:
+  push:
+    branches: ["main", "master", "develop", "staging"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_DB: atlas
+          POSTGRES_USER: atlas_user
+          POSTGRES_PASSWORD: atlas_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+      BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+      BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      TIMESCALEDB_HOST: localhost
+      TIMESCALEDB_PORT: 5432
+      TIMESCALEDB_DB: atlas
+      TIMESCALEDB_USER: atlas_user
+      TIMESCALEDB_PASSWORD: atlas_password
+      REDIS_PASSWORD: ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Apply schema
+        run: psql "postgresql://atlas_user:atlas_password@localhost:5432/atlas" -f database/schema.sql
+      - name: Run tests
+        run: pytest -q
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install and build dashboard
+        working-directory: dashboard
+        run: |
+          npm install
+          npm run build
+
+  deploy-staging:
+    needs: [test, dashboard]
+    if: github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Staging deployment hook
+        run: |
+          test -n "${{ secrets.STAGING_DEPLOY_WEBHOOK }}"
+          curl -fsS -X POST "${{ secrets.STAGING_DEPLOY_WEBHOOK }}"

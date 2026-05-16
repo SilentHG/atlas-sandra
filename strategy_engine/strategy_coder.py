@@ -25,6 +25,7 @@ import json
 import re
 import sys
 import textwrap
+from pathlib import Path
 from typing import Any
 
 import anthropic
@@ -42,16 +43,26 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
 
     Rules:
     1. The class MUST extend BaseStrategy from strategy_engine.base_strategy.
-    2. The class MUST implement generate_signal(self, symbol: str, features: pd.DataFrame) -> TradeSignal.
-    3. The `features` DataFrame has one row per bar; the most recent bar is the LAST row.
-       Column names match ATLAS feature names (e.g. rsi_14, macd_line, bb_pct_b, stoch_k_14).
-    4. Return TradeSignal with signal=Signal.BUY, SELL, HOLD, or CLOSE.
-    5. Set stop_loss, take_profit, confidence where appropriate.
-    6. Include a module-level docstring and inline comments.
-    7. Do NOT import external libraries beyond: pandas, numpy, uuid, loguru.
-    8. Output ONLY the Python source code. No markdown, no explanation.
-    9. All numeric thresholds must come from self.parameters so they are tunable.
-    10. Guard every indicator lookup with a check that the column exists and is non-NaN.
+    2. The class MUST implement ALL of these exact methods:
+       a. generate_signals(self, data: pd.DataFrame) -> pd.Series
+          - Core signal logic. The `data` DataFrame has one row per bar;
+            the most recent bar is the LAST row.
+            Column names match ATLAS feature names (e.g. rsi_14, macd_line, bb_pct_b).
+          - Return a pd.Series with values from Signal enum: BUY, SELL, HOLD, or CLOSE.
+       b. compute_position_size(self, signal, portfolio_value: float) -> float
+          - Return the number of shares/units to trade based on risk parameters.
+          - signal can be a Signal enum or TradeSignal object.
+       c. check_filters(self, data: pd.DataFrame) -> bool
+          - Return True if regime/market filters pass and trading is allowed.
+          - Must check regime_filter conditions from the spec.
+       d. get_metadata(self) -> dict
+          - Return a dict with: name, version, description, strategy_type, symbols, parameters.
+    3. Set stop_loss, take_profit, confidence where appropriate in TradeSignal.
+    4. Include a module-level docstring and inline comments.
+    5. Do NOT import external libraries beyond: pandas, numpy, uuid, loguru.
+    6. Output ONLY the Python source code. No markdown, no explanation.
+    7. All numeric thresholds must come from self.parameters so they are tunable.
+    8. Guard every indicator lookup with a check that the column exists and is non-NaN.
 """)
 
 _USER_TEMPLATE = textwrap.dedent("""\
@@ -94,13 +105,16 @@ def _get_claude_client() -> anthropic.Anthropic:
 async def _generate_code(
     client: anthropic.Anthropic,
     strategy_row: dict[str, Any],
-    model: str = "claude-opus-4-5",
-    max_tokens: int = 4096,
+    model: str = "claude-sonnet-4-20250514",
+    max_tokens: int = 8192,
 ) -> str:
     """Ask Claude to produce executable Python for the strategy spec."""
     name       = strategy_row["name"]
     class_name = _to_class_name(name)
     params     = strategy_row.get("parameters") or {}
+    if isinstance(params, str):
+        import json
+        params = json.loads(params)
 
     # Build a clean spec dict for the prompt
     spec = {
@@ -155,12 +169,24 @@ def _validate_code(code: str, strategy_name: str) -> None:
     except SyntaxError as exc:
         raise ValueError(f"Generated code has syntax error: {exc}") from exc
 
-    if "generate_signal" not in code:
-        raise ValueError("Generated code missing 'generate_signal' method")
+    required_methods = [
+        "generate_signals",
+        "compute_position_size",
+        "check_filters",
+        "get_metadata",
+    ]
+    missing = [m for m in required_methods if m not in code]
+    if missing:
+        raise ValueError(f"Generated code missing required methods: {missing}")
     if "BaseStrategy" not in code:
         raise ValueError("Generated code does not extend BaseStrategy")
-    if "TradeSignal" not in code:
-        raise ValueError("Generated code does not return TradeSignal")
+
+    # Also validate with ast.parse for stricter syntax checking
+    import ast
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        raise ValueError(f"AST parse error: {exc}") from exc
 
     logger.debug("[strategy_coder] Code validation passed for '{}'", strategy_name)
 
@@ -203,6 +229,12 @@ async def _load_pending(strategy_id: str | None = None) -> list[dict[str, Any]]:
 
 async def _save_code(strategy_id: str, code: str) -> None:
     await db.execute(_UPDATE_CODE_SQL, code, strategy_id)
+    generated_dir = Path("atlas/strategies/generated")
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    row = await db.fetchrow("SELECT name FROM strategies WHERE id = $1", strategy_id)
+    strategy_name = row["name"] if row else strategy_id
+    file_name = re.sub(r"[^a-zA-Z0-9_]+", "_", strategy_name).strip("_").lower()
+    (generated_dir / f"{file_name}.py").write_text(code, encoding="utf-8")
     logger.info("[strategy_coder] Code saved and status → active for {}", strategy_id)
 
 
@@ -211,7 +243,7 @@ async def _save_code(strategy_id: str, code: str) -> None:
 
 async def run_strategy_coder(
     strategy_id: str | None = None,
-    model: str = "claude-opus-4-5",
+    model: str = "claude-sonnet-4-20250514",
 ) -> list[str]:
     """
     Code all pending draft strategies (or a specific one by UUID).
@@ -242,10 +274,10 @@ async def run_strategy_coder(
             _validate_code(code, name)
             await _save_code(sid, code)
             coded.append(sid)
-            logger.info("[strategy_coder] ✓ '{}' activated ({} chars)", name, len(code))
+            logger.info("[strategy_coder] [OK] '{}' activated ({} chars)", name, len(code))
         except Exception as exc:
             logger.error(
-                "[strategy_coder] ✗ Failed for '{}': {}",
+                "[strategy_coder] [FAIL] Failed for '{}': {}",
                 name, exc, exc_info=True,
             )
 
@@ -264,7 +296,7 @@ async def _main() -> None:
     parser = argparse.ArgumentParser(description="ATLAS Strategy Coder")
     parser.add_argument("--id", dest="strategy_id", default=None,
                         help="UUID of a specific strategy to code (default: all pending drafts)")
-    parser.add_argument("--model", default="claude-opus-4-5",
+    parser.add_argument("--model", default="claude-sonnet-4-20250514",
                         help="Anthropic model to use")
     args = parser.parse_args()
 
@@ -282,9 +314,9 @@ async def _main() -> None:
 
     ids = await run_strategy_coder(strategy_id=args.strategy_id, model=args.model)
     if ids:
-        print(f"\n✅  {len(ids)} strategies coded and activated:\n" + "\n".join(f"  • {i}" for i in ids))
+        print(f"\n[OK]  {len(ids)} strategies coded and activated:\n" + "\n".join(f"  - {i}" for i in ids))
     else:
-        print("\n❌  No strategies were coded — check logs above.")
+        print("\n[FAIL] No strategies were coded -- check logs above.")
 
 
 if __name__ == "__main__":

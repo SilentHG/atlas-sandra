@@ -162,6 +162,7 @@ class RiskManager:
         """
         # ── 0. HOLD is a no-op ────────────────────────────────────────────────
         if signal.signal == Signal.HOLD:
+            logger.info("[risk_mgr] REJECTED {}: Signal is HOLD", signal.symbol)
             return RiskCheckResult(
                 approved=False,
                 rejection_reason="Signal is HOLD — no action required.",
@@ -171,6 +172,10 @@ class RiskManager:
         if self._stats.kill_switch or self._stats.gross_loss >= self._daily_loss_cap_usd:
             if not self._stats.kill_switch:
                 self._engage_kill_switch()
+            logger.critical(
+                "[risk_mgr] REJECTED {}: Kill switch active — daily loss ${:.2f} >= cap ${:.2f}",
+                signal.symbol, self._stats.gross_loss, self._daily_loss_cap_usd,
+            )
             return RiskCheckResult(
                 approved=False,
                 rejection_reason=(
@@ -184,6 +189,10 @@ class RiskManager:
         # ── 2. Drawdown circuit-breaker ───────────────────────────────────────
         drawdown = 1.0 - (self.capital / self._peak_capital) if self._peak_capital else 0.0
         if drawdown >= self.max_drawdown_pct:
+            logger.warning(
+                "[risk_mgr] REJECTED {}: Max drawdown {:.1%} >= {:.0%}",
+                signal.symbol, drawdown, self.max_drawdown_pct,
+            )
             return RiskCheckResult(
                 approved=False,
                 rejection_reason=(
@@ -193,17 +202,65 @@ class RiskManager:
 
         # ── 3. Symbol concentration ───────────────────────────────────────────
         if self.capital > 0 and (symbol_open_value / self.capital) >= self.max_position_pct:
+            logger.warning(
+                "[risk_mgr] REJECTED {}: Concentration {:.1%} >= {:.0%} (max exposure)",
+                signal.symbol, symbol_open_value / self.capital, self.max_position_pct,
+            )
             return RiskCheckResult(
                 approved=False,
                 rejection_reason=(
                     f"Concentration limit hit for {signal.symbol}: "
-                    f"{symbol_open_value / self.capital:.1%} ≥ {self.max_position_pct:.0%}."
+                    f"{symbol_open_value / self.capital:.1%} ≥ {self.max_position_pct:.0%}. "
+                    f"Position already at max exposure."
                 ),
             )
 
-        # ── 4. Per-trade risk check (2 % cap) ─────────────────────────────────
+        # ── 4. RISK-001: Max quantity hard limit (1000 shares) ─────────────────
         qty, risk_usd = self._size_position(signal, current_price)
 
+        MAX_QTY = 1000.0
+        if qty > MAX_QTY:
+            logger.critical(
+                "[risk_mgr] 🔴 RISK-001 REJECTED: {} qty={:.0f} exceeds max {} shares. "
+                "Order blocked.",
+                signal.symbol, qty, MAX_QTY,
+            )
+            return RiskCheckResult(
+                approved=False,
+                rejection_reason=(
+                    f"RISK-001: Order quantity {qty:.0f} exceeds maximum "
+                    f"allowed {MAX_QTY:.0f} shares per order."
+                ),
+            )
+
+        # ── 5. Order value check for orders without explicit stop risk ────────
+        order_value = qty * current_price
+        max_order_value = self.capital * self.max_risk_per_trade
+        if signal.stop_loss is None and order_value > max_order_value and self.capital > 0:
+            logger.warning(
+                "[risk_mgr] REJECTED {}: Order value ${:.2f} (qty={:.2f} × price={:.2f}) "
+                "> 2%% of portfolio ${:.2f}",
+                signal.symbol, order_value, qty, current_price, max_order_value,
+            )
+            # Try to cap quantity to stay within 2% limit
+            capped_qty = max_order_value / current_price if current_price > 0 else 0
+            if capped_qty <= 0:
+                return RiskCheckResult(
+                    approved=False,
+                    rejection_reason=(
+                        f"Order value ${order_value:,.2f} > {self.max_risk_per_trade:.0%} "
+                        f"of portfolio (${max_order_value:,.2f}). Capped qty = 0."
+                    ),
+                )
+            logger.info(
+                "[risk_mgr] {} qty capped {:.4f} → {:.4f} to respect 2%% order value limit",
+                signal.symbol, qty, capped_qty,
+            )
+            qty = capped_qty
+            order_value = qty * current_price
+            risk_usd = order_value
+
+        # ── 6. Per-trade risk check (2 % cap) ─────────────────────────────────
         portfolio_risk_pct = risk_usd / self.capital if self.capital else 0.0
         if portfolio_risk_pct > self.max_risk_per_trade:
             # Try to reduce qty so risk equals exactly the cap
@@ -211,6 +268,10 @@ class RiskManager:
             stop_dist    = abs(current_price - signal.stop_loss) if signal.stop_loss else current_price
             qty_capped   = capped_risk / stop_dist if stop_dist else 0.0
             if qty_capped <= 0:
+                logger.warning(
+                    "[risk_mgr] REJECTED {}: Per-trade risk {:.1%} > {:.0%}, capped qty=0",
+                    signal.symbol, portfolio_risk_pct, self.max_risk_per_trade,
+                )
                 return RiskCheckResult(
                     approved=False,
                     rejection_reason=(
@@ -227,6 +288,7 @@ class RiskManager:
             portfolio_risk_pct = self.max_risk_per_trade
 
         if qty <= 0:
+            logger.info("[risk_mgr] REJECTED {}: Calculated qty <= 0", signal.symbol)
             return RiskCheckResult(
                 approved=False,
                 rejection_reason="Calculated quantity ≤ 0 — trade skipped.",
@@ -393,3 +455,79 @@ class RiskManager:
             f"daily_loss=${self._stats.gross_loss:.2f} "
             f"kill_switch={self._stats.kill_switch}>"
         )
+
+    # ── Async validate_order (pre-Alpaca gate) ────────────────────────────────
+
+    async def validate_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        price: float,
+        strategy_id: str | None = None,
+    ) -> RiskCheckResult:
+        """
+        Async order validation that checks kill switch (DB) and risk limits
+        BEFORE the order reaches Alpaca. This is the primary pre-trade gate.
+        """
+        try:
+            from risk_management.kill_switch import get_kill_switch
+            ks = get_kill_switch()
+
+            # Check global kill switch from DB
+            if await ks.is_armed():
+                state = await ks.get_global_state()
+                reason = f"Kill switch armed: {state.get('reason', 'unknown')}"
+                logger.critical("[risk_mgr] REJECTED {} order: {}", symbol, reason)
+                return RiskCheckResult(approved=False, rejection_reason=reason)
+
+            # Check per-strategy kill switch
+            if strategy_id and await ks.is_strategy_killed(strategy_id):
+                reason = f"Strategy {strategy_id} is killed"
+                logger.warning("[risk_mgr] REJECTED {} order: {}", symbol, reason)
+                return RiskCheckResult(approved=False, rejection_reason=reason)
+
+            # Check qty hard limit
+            if qty > 1000:
+                reason = f"RISK-001: qty {qty} > 1000 max"
+                logger.critical("[risk_mgr] REJECTED {}: {}", symbol, reason)
+                return RiskCheckResult(approved=False, rejection_reason=reason)
+
+            # Check order value > 2% of portfolio
+            order_value = qty * price
+            max_value = self.capital * self.max_risk_per_trade
+            if order_value > max_value and self.capital > 0:
+                reason = f"Order value ${order_value:,.2f} > 2% of portfolio ${max_value:,.2f}"
+                logger.warning("[risk_mgr] REJECTED {}: {}", symbol, reason)
+                return RiskCheckResult(approved=False, rejection_reason=reason)
+
+            # Check max exposure for this symbol
+            from database import connection as db_conn
+            existing = await db_conn.fetchval(
+                "SELECT COALESCE(SUM(quantity * current_price), 0) FROM positions WHERE symbol=$1 AND status='open'",
+                symbol,
+            )
+            if existing and self.capital > 0:
+                total_exposure = float(existing) + order_value
+                if total_exposure / self.capital >= self.max_position_pct:
+                    reason = (
+                        f"Max exposure for {symbol}: existing ${float(existing):,.2f} + "
+                        f"new ${order_value:,.2f} = {total_exposure/self.capital:.1%} >= {self.max_position_pct:.0%}"
+                    )
+                    logger.warning("[risk_mgr] REJECTED: {}", reason)
+                    return RiskCheckResult(approved=False, rejection_reason=reason)
+
+            logger.info(
+                "[risk_mgr] ✅ Pre-trade check PASSED: {} {} {} @ ${:.2f}",
+                side, qty, symbol, price,
+            )
+            return RiskCheckResult(
+                approved=True,
+                adjusted_qty=qty,
+                risk_dollars=order_value,
+                portfolio_risk_pct=order_value / self.capital if self.capital else 0,
+            )
+
+        except Exception as exc:
+            logger.error("[risk_mgr] validate_order error: {}", exc)
+            return RiskCheckResult(approved=False, rejection_reason=f"Validation error: {exc}")

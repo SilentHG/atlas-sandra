@@ -7,13 +7,12 @@ Monitors fills and updates the orders / positions tables.
 
 from __future__ import annotations
 
+import json
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
 
-from config.settings import settings
 from database import connection as db
 from strategy_engine.base_strategy import TradeSignal, Signal
 
@@ -26,19 +25,20 @@ class ExecutionEngine:
         self._alpaca = None   # initialised lazily in setup()
 
     async def setup(self) -> None:
-        """Import and initialise the Alpaca client."""
+        """Initialise the Alpaca paper trading client."""
         try:
-            from alpaca.trading.client import TradingClient
-            from alpaca.trading.enums import OrderSide, TimeInForce
+            from data_ingestion.alpaca_connector import AlpacaConnector
 
-            self._alpaca = TradingClient(
-                api_key=settings.alpaca_api_key.get_secret_value(),
-                secret_key=settings.alpaca_secret_key.get_secret_value(),
-                paper=self.paper,
-            )
+            self._alpaca = AlpacaConnector()
+            await self._alpaca._open()
             logger.info("[execution] Alpaca client ready (paper={})", self.paper)
-        except ImportError:
-            logger.warning("[execution] alpaca-py not installed — using mock mode.")
+        except Exception as exc:
+            logger.error("[execution] Alpaca setup failed: {}", exc)
+            raise
+
+    async def teardown(self) -> None:
+        if self._alpaca is not None:
+            await self._alpaca._close()
 
     async def submit_order(
         self,
@@ -51,21 +51,18 @@ class ExecutionEngine:
         Returns the raw exchange response dict.
         """
         if self._alpaca is None:
-            return await self._mock_order(signal, quantity, strategy_id)
+            raise RuntimeError("ExecutionEngine.setup() must complete before submitting orders.")
 
-        from alpaca.trading.requests import MarketOrderRequest
-        from alpaca.trading.enums import OrderSide, TimeInForce
-
-        side = OrderSide.BUY if signal.signal == Signal.BUY else OrderSide.SELL
-        req  = MarketOrderRequest(
-            symbol       = signal.symbol,
-            qty          = quantity,
-            side         = side,
-            time_in_force= TimeInForce.GTC,
-        )
+        side = "buy" if signal.signal == Signal.BUY else "sell"
         try:
-            order = self._alpaca.submit_order(req)
-            raw   = order.model_dump() if hasattr(order, "model_dump") else dict(order)
+            raw = await self._alpaca.submit_order(
+                symbol=signal.symbol,
+                qty=quantity,
+                side=side,
+                order_type="market",
+                time_in_force="day",
+                client_order_id=str(uuid.uuid4()),
+            )
             await self._persist_order(signal, quantity, strategy_id, raw)
             logger.info("[execution] Order submitted: {} {} {}", side, signal.symbol, quantity)
             return raw
@@ -74,26 +71,6 @@ class ExecutionEngine:
             raise
 
     # ── Internals ─────────────────────────────────────────────
-
-    async def _mock_order(
-        self,
-        signal:      TradeSignal,
-        quantity:    float,
-        strategy_id: uuid.UUID | None,
-    ) -> dict[str, Any]:
-        """Simulate order fill for testing without a live connection."""
-        raw = {
-            "id":     str(uuid.uuid4()),
-            "symbol": signal.symbol,
-            "qty":    quantity,
-            "side":   signal.signal.value.lower(),
-            "status": "filled",
-            "filled_avg_price": signal.entry_price,
-            "mock": True,
-        }
-        await self._persist_order(signal, quantity, strategy_id, raw)
-        logger.info("[execution] Mock order filled: {} {} @ {}", signal.signal, signal.symbol, signal.entry_price)
-        return raw
 
     async def _persist_order(
         self,
@@ -120,5 +97,5 @@ class ExecutionEngine:
             signal.entry_price,
             signal.stop_loss,
             self.paper,
-            str(raw).replace("'", '"'),
+            json.dumps(raw),
         )

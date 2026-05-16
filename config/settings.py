@@ -42,6 +42,7 @@ class ATLASSettings(BaseSettings):
     alpaca_api_key:    str = Field(..., alias="ALPACA_API_KEY")
     alpaca_secret_key: str = Field(..., alias="ALPACA_SECRET_KEY")
     alpaca_base_url:   str = Field("https://paper-api.alpaca.markets", alias="ALPACA_BASE_URL")
+    youtube_api_key:   str | None = Field(None, alias="YOUTUBE_API_KEY")
 
     # ── Database ─────────────────────────────────────────────
     timescaledb_host:     str       = Field("127.0.0.1",  alias="TIMESCALEDB_HOST")
