@@ -213,7 +213,7 @@ def _get_claude_client() -> anthropic.Anthropic:
 async def _generate_spec(
     client: anthropic.Anthropic,
     user_prompt: str,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5",
     max_tokens: int = 2048,
 ) -> dict[str, Any]:
     """
@@ -366,7 +366,7 @@ async def _save_strategy(spec: dict[str, Any]) -> str:
 
 async def run_ideator(
     n: int = 10,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5",
 ) -> list[str]:
     """
     Generate `n` strategy specs via Claude and save them to the DB.

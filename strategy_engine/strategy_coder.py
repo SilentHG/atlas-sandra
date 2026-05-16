@@ -105,7 +105,7 @@ def _get_claude_client() -> anthropic.Anthropic:
 async def _generate_code(
     client: anthropic.Anthropic,
     strategy_row: dict[str, Any],
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5",
     max_tokens: int = 8192,
 ) -> str:
     """Ask Claude to produce executable Python for the strategy spec."""
@@ -243,7 +243,7 @@ async def _save_code(strategy_id: str, code: str) -> None:
 
 async def run_strategy_coder(
     strategy_id: str | None = None,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5",
 ) -> list[str]:
     """
     Code all pending draft strategies (or a specific one by UUID).
@@ -296,7 +296,7 @@ async def _main() -> None:
     parser = argparse.ArgumentParser(description="ATLAS Strategy Coder")
     parser.add_argument("--id", dest="strategy_id", default=None,
                         help="UUID of a specific strategy to code (default: all pending drafts)")
-    parser.add_argument("--model", default="claude-sonnet-4-20250514",
+    parser.add_argument("--model", default="claude-sonnet-4-5",
                         help="Anthropic model to use")
     args = parser.parse_args()
 

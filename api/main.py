@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from loguru import logger
@@ -93,8 +94,9 @@ class GenerateStrategyRequest(BaseModel):
     symbols: list[str] = ["AAPL", "MSFT"]
 
 class SpawnAgentRequest(BaseModel):
-    agent_type: str
-    name: str
+    type: str | None = None
+    agent_type: str | None = None
+    name: str | None = None
     config: dict = {}
 
 class AgentRegistryRequest(BaseModel):
@@ -111,10 +113,45 @@ class PatternRequest(BaseModel):
     symbol: str
     lookback_bars: int = 100
 
+class BacktestRunRequest(BaseModel):
+    strategy_id: str = ""
+    symbol: str = "AAPL"
+    start: str | None = None
+    end: str | None = None
+    qty: float = 10.0
+    parameters: dict = {}
+
+class WalkForwardRequest(BacktestRunRequest):
+    window_days: int = 30
+    step_days: int = 7
+    windows: int = 3
+
+class SensitivityRequest(BacktestRunRequest):
+    qty_multipliers: list[float] = [0.5, 1.0, 1.5, 2.0]
+
+class RegimeTestRequest(BacktestRunRequest):
+    regimes: dict[str, dict[str, str]] = {}
+
+class ScoutTestRequest(BaseModel):
+    source: str
+    subreddits: list[str] = ["algotrading"]
+    query: str = "momentum trading"
+    limit: int = 5
+    max_results: int = 5
+
 class KillSwitchRequest(BaseModel):
     action: str = "arm"
     strategy_id: str | None = None
     reason: str | None = None
+
+
+def _parse_api_datetime(value: str | None, default: datetime) -> datetime:
+    if not value:
+        return default
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 # ── Health ────────────────────────────────────────────────────────────────────
 
@@ -232,15 +269,157 @@ async def list_strategies():
 @app.post("/api/strategies/generate")
 async def generate_strategy(req: GenerateStrategyRequest):
     try:
-        from strategy_engine.ideator import StrategyIdeator
-        from strategy_engine.strategy_coder import StrategyCoder
-        ideator = StrategyIdeator()
-        await ideator.generate_strategies(strategy_types=[req.strategy_type], symbols=req.symbols)
-        coder = StrategyCoder()
-        await coder.code_pending_strategies()
-        return {"status": "ok", "message": "Strategy generated and coded"}
+        from strategy_engine.ideator import run_ideator
+        from strategy_engine.strategy_coder import run_strategy_coder
+
+        strategy_ids = await run_ideator(n=1)
+        coded_ids = await run_strategy_coder(strategy_id=strategy_ids[0] if strategy_ids else None)
+        return {
+            "status": "ok",
+            "generated_strategy_ids": strategy_ids,
+            "coded_strategy_ids": coded_ids,
+            "requested_type": req.strategy_type,
+            "requested_symbols": req.symbols,
+        }
     except Exception as exc:
         logger.error("[api] generate_strategy error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+# ── Backtesting ───────────────────────────────────────────────────────────────
+
+@app.post("/api/backtest/run")
+async def run_backtest(req: BacktestRunRequest):
+    try:
+        from backtesting.backtest_engine import BacktestEngine
+
+        end = _parse_api_datetime(req.end, datetime.now(timezone.utc))
+        start = _parse_api_datetime(req.start, end - timedelta(days=30))
+        engine = BacktestEngine()
+        results = await engine.run(
+            symbol=req.symbol,
+            start=start,
+            end=end,
+            strategy_id=req.strategy_id,
+            parameters=req.parameters,
+            qty=req.qty,
+        )
+        return jsonable_encoder({
+            "status": "completed",
+            "symbol": req.symbol,
+            "strategy_id": req.strategy_id,
+            "results": results,
+        })
+    except Exception as exc:
+        logger.error("[api] run_backtest error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/backtest/walk-forward")
+async def walk_forward_backtest(req: WalkForwardRequest):
+    try:
+        from backtesting.backtest_engine import BacktestEngine
+
+        end = _parse_api_datetime(req.end, datetime.now(timezone.utc))
+        step = timedelta(days=req.step_days)
+        window = timedelta(days=req.window_days)
+        engine = BacktestEngine()
+        runs = []
+
+        first_start = _parse_api_datetime(
+            req.start,
+            end - step * max(req.windows - 1, 0) - window,
+        )
+        for idx in range(req.windows):
+            start = first_start + step * idx
+            stop = start + window
+            if stop > end:
+                stop = end
+            if start >= stop:
+                continue
+            results = await engine.run(
+                symbol=req.symbol,
+                start=start,
+                end=stop,
+                strategy_id=req.strategy_id,
+                parameters={**req.parameters, "walk_forward_window": idx + 1},
+                qty=req.qty,
+            )
+            runs.append({"window": idx + 1, "start": start, "end": stop, "results": results})
+
+        return jsonable_encoder({"status": "completed", "runs": runs})
+    except Exception as exc:
+        logger.error("[api] walk_forward_backtest error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/backtest/sensitivity")
+async def sensitivity_backtest(req: SensitivityRequest):
+    try:
+        from backtesting.backtest_engine import BacktestEngine
+
+        end = _parse_api_datetime(req.end, datetime.now(timezone.utc))
+        start = _parse_api_datetime(req.start, end - timedelta(days=30))
+        engine = BacktestEngine()
+        runs = []
+        holdout_returns = []
+
+        for multiplier in req.qty_multipliers:
+            qty = req.qty * multiplier
+            results = await engine.run(
+                symbol=req.symbol,
+                start=start,
+                end=end,
+                strategy_id=req.strategy_id,
+                parameters={**req.parameters, "sensitivity_qty_multiplier": multiplier},
+                qty=qty,
+            )
+            holdout = results.get("holdout")
+            if holdout:
+                holdout_returns.append(float(holdout.total_return))
+            runs.append({"qty_multiplier": multiplier, "qty": qty, "results": results})
+
+        dispersion = 0.0
+        if len(holdout_returns) > 1:
+            dispersion = max(holdout_returns) - min(holdout_returns)
+        return jsonable_encoder({
+            "status": "completed",
+            "overfitting_risk": "high" if dispersion > 0.25 else "normal",
+            "holdout_return_dispersion": dispersion,
+            "runs": runs,
+        })
+    except Exception as exc:
+        logger.error("[api] sensitivity_backtest error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/backtest/regime-test")
+async def regime_backtest(req: RegimeTestRequest):
+    try:
+        from backtesting.backtest_engine import BacktestEngine
+
+        engine = BacktestEngine()
+        regimes = req.regimes or {
+            "recent": {
+                "start": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+                "end": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+        runs = {}
+        for name, window in regimes.items():
+            end = _parse_api_datetime(window.get("end"), datetime.now(timezone.utc))
+            start = _parse_api_datetime(window.get("start"), end - timedelta(days=30))
+            runs[name] = await engine.run(
+                symbol=req.symbol,
+                start=start,
+                end=end,
+                strategy_id=req.strategy_id,
+                parameters={**req.parameters, "regime": name},
+                qty=req.qty,
+            )
+        return jsonable_encoder({"status": "completed", "regimes": runs})
+    except Exception as exc:
+        logger.error("[api] regime_backtest error: {}", exc)
         raise HTTPException(500, str(exc))
 
 # ── Positions ─────────────────────────────────────────────────────────────────
@@ -469,13 +648,19 @@ async def kill_agent(agent_name: str):
 @app.post("/api/agents/spawn")
 async def spawn_agent(req: SpawnAgentRequest):
     try:
+        agent_type = req.type or req.agent_type
+        if not agent_type:
+            raise HTTPException(400, "Request body must include 'type'.")
+        name = req.name or f"{agent_type}_{uuid.uuid4().hex[:8]}"
         await db.execute(
             """INSERT INTO agent_registry (name, agent_type, metadata, status)
                VALUES ($1, $2, $3::jsonb, 'idle')
                ON CONFLICT (name) DO UPDATE SET status='idle', updated_at=NOW()""",
-            req.name, req.agent_type, json.dumps(req.config),
+            name, agent_type, json.dumps(req.config),
         )
-        return {"status": "spawned", "name": req.name, "agent_type": req.agent_type}
+        return {"status": "spawned", "name": name, "agent_type": agent_type}
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("[api] spawn_agent error: {}", exc)
         raise HTTPException(500, str(exc))
@@ -505,6 +690,44 @@ async def test_order(req: OrderRequest):
         logger.error("[api] test_order error: {}", exc)
         raise HTTPException(500, str(exc))
 
+
+# ── Scouts ────────────────────────────────────────────────────────────────────
+
+@app.post("/api/scouts/test")
+async def test_scout(req: ScoutTestRequest):
+    try:
+        source = req.source.lower().strip()
+        if source == "reddit":
+            from scouts.reddit_scout import RedditScout
+
+            scout = RedditScout()
+            await scout.setup()
+            hypotheses = await scout.scan(subreddits=req.subreddits, limit=req.limit)
+        elif source == "youtube":
+            from scouts.youtube_scout import YouTubeScout
+
+            scout = YouTubeScout()
+            await scout.setup()
+            hypotheses = await scout.search_and_extract(
+                query=req.query,
+                max_results=req.max_results,
+            )
+        else:
+            raise HTTPException(400, "source must be 'reddit' or 'youtube'")
+
+        return {
+            "status": "completed",
+            "source": source,
+            "count": len(hypotheses),
+            "hypotheses": hypotheses,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[api] test_scout error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
 # ── Dashboard brief ───────────────────────────────────────────────────────────
 
 @app.post("/api/dashboard/generate-brief")
@@ -517,7 +740,7 @@ async def generate_brief():
         )
         snapshot = [dict(r) for r in rows]
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=600,
             messages=[{
                 "role": "user",
