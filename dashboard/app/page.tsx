@@ -1,122 +1,44 @@
-import { Activity, BriefcaseBusiness, ShieldAlert, TrendingUp } from "lucide-react";
+"use client";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080";
+import { Notice } from "@/components/Notice";
+import { PageHeader } from "@/components/PageHeader";
+import { StatCard } from "@/components/StatCard";
+import { usePolling } from "@/lib/usePolling";
+import type { HealthResponse } from "@/lib/types";
 
-async function getJson<T>(path: string, fallback: T): Promise<T> {
-  try {
-    const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
-    if (!res.ok) return fallback;
-    return (await res.json()) as T;
-  } catch {
-    return fallback;
-  }
+function serviceStatus(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && "status" in value) return String((value as { status?: unknown }).status || "unknown");
+  if (value && typeof value === "object") return "ok";
+  return "unknown";
 }
 
-type Portfolio = {
-  open_count?: number;
-  total_unrealized_pnl?: number;
-  total_realized_pnl?: number;
-  daily_pnl?: number;
-};
+function isErrorStatus(value: string): boolean {
+  return value.toLowerCase().startsWith("error");
+}
 
-type Position = {
-  symbol: string;
-  side: string;
-  quantity: number;
-  current_price?: number;
-  unrealized_pnl?: number;
-  pnl?: number;
-};
-
-type Strategy = {
-  id: string;
-  name: string;
-  strategy_type: string;
-  status: string;
-  symbols: string[];
-};
-
-export default async function Page() {
-  const [portfolio, positions, strategies, risk] = await Promise.all([
-    getJson<Portfolio>("/portfolio", {}),
-    getJson<Position[]>("/positions", []),
-    getJson<Strategy[]>("/strategies", []),
-    getJson<{ kill_switch_armed?: boolean; reason?: string }>("/api/risk/status", {})
-  ]);
+export default function OverviewPage() {
+  const { data, loading, error, refreshedAt } = usePolling<HealthResponse>("/health");
+  const services = data?.services || {};
+  const dbStatus = serviceStatus(services.timescaledb);
+  const killSwitch = serviceStatus(services.kill_switch);
+  const registry = services.agent_registry as { running?: number; total?: number } | undefined;
+  const strategies = services.strategies as { total?: number; active?: number } | undefined;
 
   return (
-    <main>
-      <header className="topbar">
-        <div>
-          <h1>ATLAS</h1>
-          <p>Shah Equity Holdings trading operations</p>
-        </div>
-        <div className={risk.kill_switch_armed ? "status danger" : "status ok"}>
-          <ShieldAlert size={18} />
-          {risk.kill_switch_armed ? "Trading halted" : "Risk gates armed"}
-        </div>
-      </header>
-
-      <section className="metrics">
-        <article>
-          <BriefcaseBusiness size={22} />
-          <span>Open Positions</span>
-          <strong>{portfolio.open_count ?? positions.length}</strong>
-        </article>
-        <article>
-          <TrendingUp size={22} />
-          <span>Daily P&L</span>
-          <strong>${Number(portfolio.daily_pnl ?? 0).toFixed(2)}</strong>
-        </article>
-        <article>
-          <Activity size={22} />
-          <span>Strategies</span>
-          <strong>{strategies.length}</strong>
-        </article>
+    <>
+      <PageHeader title="System Overview" subtitle="Live ATLAS service health and operating state" refreshedAt={refreshedAt} />
+      <Notice loading={loading} error={error} />
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="TimescaleDB" value={isErrorStatus(dbStatus) ? "ERROR" : dbStatus.toUpperCase()} status={dbStatus} detail="GET /health" />
+        <StatCard label="Kill Switch" value={killSwitch.toUpperCase()} status={killSwitch === "ARMED" || killSwitch === "armed"} detail="Persistent risk halt state" />
+        <StatCard label="Total Strategies" value={strategies?.total ?? "-"} status="ok" detail={`${strategies?.active ?? 0} active`} />
+        <StatCard label="Active Agents" value={registry?.running ?? "-"} status={(registry?.running ?? 0) > 0 ? "running" : "paused"} detail={`${registry?.total ?? 0} registered`} />
+      </div>
+      <section className="mt-6 rounded-lg border border-atlas-line bg-atlas-panel p-4">
+        <h2 className="text-lg font-semibold">Service Payload</h2>
+        <pre className="mt-4 max-h-[520px] overflow-auto rounded-md bg-atlas-bg p-4 text-xs text-atlas-muted">{JSON.stringify(data, null, 2)}</pre>
       </section>
-
-      <section className="grid">
-        <div>
-          <h2>Positions</h2>
-          <table>
-            <thead>
-              <tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Mark</th><th>P&L</th></tr>
-            </thead>
-            <tbody>
-              {positions.map((p) => (
-                <tr key={`${p.symbol}-${p.side}`}>
-                  <td>{p.symbol}</td>
-                  <td>{p.side}</td>
-                  <td>{Number(p.quantity).toFixed(4)}</td>
-                  <td>${Number(p.current_price ?? 0).toFixed(2)}</td>
-                  <td>${Number(p.unrealized_pnl ?? p.pnl ?? 0).toFixed(2)}</td>
-                </tr>
-              ))}
-              {positions.length === 0 && <tr><td colSpan={5}>No open positions from the API.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-
-        <div>
-          <h2>Strategy Scoreboard</h2>
-          <table>
-            <thead>
-              <tr><th>Name</th><th>Type</th><th>Status</th><th>Symbols</th></tr>
-            </thead>
-            <tbody>
-              {strategies.map((s) => (
-                <tr key={s.id}>
-                  <td>{s.name}</td>
-                  <td>{s.strategy_type}</td>
-                  <td>{s.status}</td>
-                  <td>{Array.isArray(s.symbols) ? s.symbols.join(", ") : ""}</td>
-                </tr>
-              ))}
-              {strategies.length === 0 && <tr><td colSpan={4}>No strategies returned by the API.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-      </section>
-    </main>
+    </>
   );
 }

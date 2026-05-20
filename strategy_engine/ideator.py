@@ -213,7 +213,7 @@ def _get_claude_client() -> anthropic.Anthropic:
 async def _generate_spec(
     client: anthropic.Anthropic,
     user_prompt: str,
-    model: str = "claude-sonnet-4-5",
+    model: str = "claude-sonnet-4-6",
     max_tokens: int = 2048,
 ) -> dict[str, Any]:
     """
@@ -366,7 +366,7 @@ async def _save_strategy(spec: dict[str, Any]) -> str:
 
 async def run_ideator(
     n: int = 10,
-    model: str = "claude-sonnet-4-5",
+    model: str = "claude-sonnet-4-6",
 ) -> list[str]:
     """
     Generate `n` strategy specs via Claude and save them to the DB.
@@ -433,3 +433,83 @@ async def _main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(_main())
+
+
+# ── Dynamic ideator (Fix 1 and 2) ────────────────────────────────────────────
+
+def _build_dynamic_prompt(asset_class, symbols, timeframe, style, lookback_days):
+    symbol_str = ", ".join(symbols) if symbols else "AAPL, MSFT, NVDA"
+    style_hints = {
+        "momentum":       "EMA crossovers, RSI confirmation, MACD histogram, trend-following entries",
+        "mean_reversion": "Bollinger Bands %B, RSI extremes, Williams %R, reversion to mean",
+        "breakout":       "20-day high breakout, volume surge > 2x average, ADX > 25 confirmation",
+        "trend":          "SMA/EMA alignment, ADX trend strength, regime filtering with SMA-200",
+        "scalping":       "VWAP deviation, short timeframe RSI, tight stops, high frequency",
+    }
+    asset_hints = {
+        "us_equities": "US equity market hours 9:30am-4pm ET, use SMA-200 regime filter",
+        "crypto":      "24/7 market, higher volatility, use wider stops, BTC correlation filter",
+    }
+    style_desc = style_hints.get(style, style_hints["momentum"])
+    asset_desc = asset_hints.get(asset_class, asset_hints["us_equities"])
+    return f"""Design a {style} strategy for {asset_class} assets.
+
+Symbols to trade: {symbol_str}
+Timeframe: {timeframe}
+Lookback period: {lookback_days} days
+Market context: {asset_desc}
+
+Strategy requirements:
+- Style: {style} — use {style_desc}
+- Entry conditions: define precise indicator thresholds with exact numeric values
+- Exit conditions: both take-profit and stop-loss rules required
+- Stop-loss: ATR-based preferred, define multiplier explicitly
+- Position sizing: risk 1-2% of capital per trade
+- Regime filter: only trade in appropriate market conditions
+- Use only these available features: sma_5, sma_10, sma_20, sma_50, sma_200,
+  ema_9, ema_21, rsi_7, rsi_14, macd, macd_signal, macd_hist, bb_upper,
+  bb_lower, bb_position, bb_bandwidth, atr_14, atr_14_pct, vwap,
+  stoch_k, stoch_d, williams_r, cci_20, adx_14, obv_signal, roc_20,
+  vol_sma_ratio_20, hl_range, hl_range_pct, gap_flag, gap_pct,
+  regime_score, regime_trend, regime_high_vol, golden_cross,
+  dist_sma50_pct, corr_msft_20, corr_nvda_20, corr_tsla_20, corr_aapl_20
+
+Return a complete JSON strategy specification."""
+
+
+async def run_ideator_dynamic(
+    asset_class="us_equities",
+    symbols=None,
+    timeframe="1h",
+    style="momentum",
+    lookback_days=90,
+    custom_prompt=None,
+    model="claude-sonnet-4-6",
+):
+    """Generate a strategy dynamically from request parameters."""
+    await db.init_pool()
+    client = _get_claude_client()
+    if symbols is None:
+        symbols = ["AAPL", "MSFT", "NVDA"]
+    prompt = custom_prompt or _build_dynamic_prompt(asset_class, symbols, timeframe, style, lookback_days)
+    logger.info("[ideator] Dynamic generation | asset={} symbols={} timeframe={} style={}", asset_class, symbols, timeframe, style)
+    saved_ids = []
+    try:
+        spec = await _generate_spec(client, prompt, model=model)
+        spec["_generation_meta"] = {
+            "user_prompt": prompt,
+            "asset_class": asset_class,
+            "symbols": symbols,
+            "timeframe": timeframe,
+            "style": style,
+            "lookback_days": lookback_days,
+            "model": model,
+        }
+        logger.info("[ideator] Generated: '{}' ({})", spec["name"], spec["strategy_type"])
+        sid = await _save_strategy(spec)
+        saved_ids.append(sid)
+        logger.info("[ideator] Strategy saved: {}", sid)
+    except Exception as exc:
+        logger.error("[ideator] Dynamic generation failed: {}", exc, exc_info=True)
+    await db.close_pool()
+    return saved_ids

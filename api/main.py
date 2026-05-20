@@ -92,6 +92,11 @@ class SimulatePnlRequest(BaseModel):
 class GenerateStrategyRequest(BaseModel):
     strategy_type: str = "trend"
     symbols: list[str] = ["AAPL", "MSFT"]
+    asset_class: str = "us_equities"
+    timeframe: str = "1h"
+    style: str = "momentum"
+    lookback_days: int = 90
+    custom_prompt: str | None = None
 
 class SpawnAgentRequest(BaseModel):
     type: str | None = None
@@ -195,7 +200,18 @@ async def health():
     except Exception as e:
         services["agent_registry"] = f"error: {e}"
 
-    # 4. Kill switch status
+    # 4. Strategy inventory
+    try:
+        total = await db.fetchval("SELECT COUNT(*) FROM strategies")
+        active = await db.fetchval("SELECT COUNT(*) FROM strategies WHERE status='active'")
+        services["strategies"] = {
+            "total": int(total or 0),
+            "active": int(active or 0),
+        }
+    except Exception as e:
+        services["strategies"] = f"error: {e}"
+
+    # 5. Kill switch status
     try:
         ks = get_kill_switch()
         armed = await ks.is_armed()
@@ -203,7 +219,7 @@ async def health():
     except Exception as e:
         services["kill_switch"] = f"error: {e}"
 
-    # 5. Last data timestamp
+    # 6. Last data timestamp
     try:
         last_ts = await db.fetchval("SELECT MAX(timestamp) FROM market_data")
         if last_ts:
@@ -272,7 +288,15 @@ async def generate_strategy(req: GenerateStrategyRequest):
         from strategy_engine.ideator import run_ideator
         from strategy_engine.strategy_coder import run_strategy_coder
 
-        strategy_ids = await run_ideator(n=1)
+        from strategy_engine.ideator import run_ideator_dynamic
+        strategy_ids = await run_ideator_dynamic(
+            asset_class=req.asset_class,
+            symbols=req.symbols,
+            timeframe=req.timeframe,
+            style=req.style,
+            lookback_days=req.lookback_days,
+            custom_prompt=req.custom_prompt,
+        )
         coded_ids = await run_strategy_coder(strategy_id=strategy_ids[0] if strategy_ids else None)
         return {
             "status": "ok",
@@ -280,6 +304,9 @@ async def generate_strategy(req: GenerateStrategyRequest):
             "coded_strategy_ids": coded_ids,
             "requested_type": req.strategy_type,
             "requested_symbols": req.symbols,
+            "asset_class": req.asset_class,
+            "timeframe": req.timeframe,
+            "style": req.style,
         }
     except Exception as exc:
         logger.error("[api] generate_strategy error: {}", exc)
@@ -443,14 +470,20 @@ async def risk_status():
     try:
         ks = get_kill_switch()
         state = await ks.get_global_state()
+        capital = float(state.get("capital") or 100_000)
+        daily_limit_pct = 0.02
+        weekly_limit_pct = 0.04
         return {
             "kill_switch_armed": state.get("armed", False),
             "reason":            state.get("reason"),
             "armed_at":          str(state.get("armed_at") or ""),
             "daily_loss_usd":    float(state.get("daily_loss_usd") or 0),
             "weekly_loss_usd":   float(state.get("weekly_loss_usd") or 0),
-            "daily_limit_pct":   0.02,
-            "weekly_limit_pct":  0.04,
+            "capital":           capital,
+            "daily_limit_pct":   daily_limit_pct,
+            "weekly_limit_pct":  weekly_limit_pct,
+            "daily_limit_usd":   capital * daily_limit_pct,
+            "weekly_limit_usd":  capital * weekly_limit_pct,
         }
     except Exception as exc:
         logger.error("[api] risk_status error: {}", exc)
@@ -740,7 +773,7 @@ async def generate_brief():
         )
         snapshot = [dict(r) for r in rows]
         msg = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-6",
             max_tokens=600,
             messages=[{
                 "role": "user",
