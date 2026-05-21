@@ -58,3 +58,4 @@ models/
 *.joblib
 *.h5
 *.parquet
+atlas/strategies/generated/*.py
