@@ -34,6 +34,7 @@ from copy_trading.copy_engine import CopyTradingEngine
 from dashboard_services.intelligence_brief import IntelligenceBriefService
 from validation.sensitivity_analysis import SensitivityAnalyzer
 from validation.regime_testing import RegimeTester
+from strategy_engine.strategy_coder import _validate_code
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -860,6 +861,41 @@ async def detect_patterns(req: PatternRequest):
         elif rsi_now > 70:
             patterns.append({"pattern": "rsi_overbought", "rsi": round(rsi_now, 2), "confidence": 0.8})
 
+        # Fallback market-state pattern so PATT-001 always returns interpretable output
+        if not patterns:
+            recent_close = float(close.iloc[-1])
+            prior_close = float(close.iloc[max(0, len(close) - 21)])
+            pct_change = ((recent_close - prior_close) / prior_close * 100) if prior_close else 0.0
+            avg_range = float((df["high"] - df["low"]).tail(20).mean())
+            avg_volume = float(df["volume"].tail(20).mean())
+
+            if pct_change > 1:
+                state = "bullish_drift"
+                description = "Price has moved higher over the recent lookback without triggering a classic reversal pattern."
+                confidence = 0.62
+            elif pct_change < -1:
+                state = "bearish_drift"
+                description = "Price has moved lower over the recent lookback without triggering a classic reversal pattern."
+                confidence = 0.62
+            else:
+                state = "range_consolidation"
+                description = "Price is consolidating in a narrow range without a strong directional breakout."
+                confidence = 0.6
+
+            patterns.append({
+                "pattern": state,
+                "description": description,
+                "confidence": confidence,
+                "supporting_data": {
+                    "recent_close": round(recent_close, 4),
+                    "prior_close": round(prior_close, 4),
+                    "pct_change_20_bars": round(pct_change, 4),
+                    "avg_range_20_bars": round(avg_range, 4),
+                    "avg_volume_20_bars": round(avg_volume, 4),
+                    "bars_analysed": len(df),
+                },
+            })
+
         return {"symbol": req.symbol, "patterns": patterns, "bars_analysed": len(df)}
     except HTTPException:
         raise
@@ -1067,6 +1103,74 @@ async def generate_daily_intelligence_brief():
     pool = await db.get_pool()
     service = IntelligenceBriefService(pool)
     return await service.generate_brief()
+
+
+
+# ── Strategy Code Validation (GEN-003) ────────────────────────────────────────
+
+@app.post("/api/strategies/{strategy_id}/validate")
+async def validate_generated_strategy(strategy_id: str):
+    row = await db.fetchrow(
+        """
+        SELECT id, name, code
+        FROM strategies
+        WHERE id = $1::uuid
+        """,
+        strategy_id,
+    )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    code = row["code"]
+    name = row["name"] or f"strategy_{strategy_id}"
+
+    if not code:
+        return {
+            "strategy_id": strategy_id,
+            "valid": False,
+            "status": "fail",
+            "errors": ["Strategy has no generated code"],
+            "required_methods": [
+                "generate_signals",
+                "compute_position_size",
+                "check_filters",
+                "get_metadata",
+            ],
+        }
+
+    try:
+        _validate_code(code, name)
+        return {
+            "strategy_id": strategy_id,
+            "valid": True,
+            "status": "pass",
+            "errors": [],
+            "required_methods": [
+                "generate_signals",
+                "compute_position_size",
+                "check_filters",
+                "get_metadata",
+            ],
+            "checks": {
+                "syntax": "pass",
+                "interface": "pass",
+                "base_strategy": "pass",
+            },
+        }
+    except Exception as exc:
+        return {
+            "strategy_id": strategy_id,
+            "valid": False,
+            "status": "fail",
+            "errors": [str(exc)],
+            "required_methods": [
+                "generate_signals",
+                "compute_position_size",
+                "check_filters",
+                "get_metadata",
+            ],
+        }
 
 
 
