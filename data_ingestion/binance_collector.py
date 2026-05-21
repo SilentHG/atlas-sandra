@@ -75,7 +75,7 @@ def _parse_kline(payload: dict[str, Any]) -> dict[str, Any] | None:
             return None   # interim update — skip
 
         return {
-            "symbol":     k["s"],
+            "symbol":     {"BTCUSDT": "BTC/USDT", "ETHUSDT": "ETH/USDT", "SOLUSDT": "SOL/USDT"}.get(k["s"], k["s"]),
             "timestamp":  datetime.fromtimestamp(k["t"] / 1_000, tz=timezone.utc),
             "open":       float(k["o"]),
             "high":       float(k["h"]),

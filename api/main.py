@@ -30,6 +30,10 @@ from config.settings import settings
 from database import connection as db
 from risk_management.kill_switch import get_kill_switch
 from risk_management.risk_manager import RiskManager
+from copy_trading.copy_engine import CopyTradingEngine
+from dashboard_services.intelligence_brief import IntelligenceBriefService
+from validation.sensitivity_analysis import SensitivityAnalyzer
+from validation.regime_testing import RegimeTester
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -114,6 +118,31 @@ class AgentRegistryRequest(BaseModel):
     heartbeat_interval_s: int = 30
     metadata: dict = {}
 
+
+class CopyTradingLinkRequest(BaseModel):
+    leader_account: str
+    follower_account: str
+    follower_risk_limit_pct: float = 0.02
+    sizing_mode: str = "proportional"
+
+class CopyTradingMirrorRequest(BaseModel):
+    leader_account: str = "leader_demo"
+    leader_order_id: str = "leader-paper-order"
+    symbol: str = "AAPL"
+    side: str = "buy"
+    leader_qty: float = 10
+    leader_equity: float = 100000
+    follower_equity: float = 25000
+    price: float = 100
+
+class SensitivityRequest(BaseModel):
+    baseline_metrics: dict
+    variant_metrics: list[dict]
+    variation_pct: float = 20.0
+
+class RegimeValidationRequest(BaseModel):
+    regime_metrics: dict
+
 class PatternRequest(BaseModel):
     symbol: str
     lookback_bars: int = 100
@@ -131,7 +160,7 @@ class WalkForwardRequest(BacktestRunRequest):
     step_days: int = 7
     windows: int = 3
 
-class SensitivityRequest(BacktestRunRequest):
+class BacktestSensitivityRequest(BacktestRunRequest):
     qty_multipliers: list[float] = [0.5, 1.0, 1.5, 2.0]
 
 class RegimeTestRequest(BacktestRunRequest):
@@ -975,6 +1004,70 @@ async def stream_signals(request: Request):
             "Connection":        "keep-alive",
         },
     )
+
+
+# ── Day 4: Copy Trading ───────────────────────────────────────────────────────
+
+@app.post("/api/copy-trading/link")
+async def create_copy_trading_link(req: CopyTradingLinkRequest):
+    pool = await db.get_pool()
+    engine = CopyTradingEngine(pool)
+    link_id = await engine.create_link(
+        leader_account=req.leader_account,
+        follower_account=req.follower_account,
+        follower_risk_limit_pct=req.follower_risk_limit_pct,
+        sizing_mode=req.sizing_mode,
+    )
+    return {
+        "status": "created",
+        "link_id": link_id,
+        "leader_account": req.leader_account,
+        "follower_account": req.follower_account,
+    }
+
+
+@app.post("/api/copy-trading/mirror-test")
+async def mirror_copy_trade_test(req: CopyTradingMirrorRequest):
+    pool = await db.get_pool()
+    engine = CopyTradingEngine(pool)
+    result = await engine.mirror_trade(
+        leader_account=req.leader_account,
+        leader_order_id=req.leader_order_id,
+        symbol=req.symbol,
+        side=req.side,
+        leader_qty=req.leader_qty,
+        leader_equity=req.leader_equity,
+        follower_equity=req.follower_equity,
+        price=req.price,
+    )
+    return result
+
+
+# ── Day 4: Validation ─────────────────────────────────────────────────────────
+
+@app.post("/api/validation/sensitivity")
+async def run_sensitivity_analysis(req: SensitivityRequest):
+    analyzer = SensitivityAnalyzer(variation_pct=req.variation_pct)
+    return analyzer.analyze(
+        baseline_metrics=req.baseline_metrics,
+        variant_metrics=req.variant_metrics,
+    )
+
+
+@app.post("/api/validation/regime-test")
+async def run_regime_validation(req: RegimeValidationRequest):
+    tester = RegimeTester()
+    return tester.evaluate(req.regime_metrics)
+
+
+# ── Day 4: Daily Intelligence Brief ───────────────────────────────────────────
+
+@app.post("/api/dashboard/generate-brief")
+async def generate_daily_intelligence_brief():
+    pool = await db.get_pool()
+    service = IntelligenceBriefService(pool)
+    return await service.generate_brief()
+
 
 
 if __name__ == "__main__":

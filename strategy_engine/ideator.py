@@ -511,5 +511,7 @@ async def run_ideator_dynamic(
         logger.info("[ideator] Strategy saved: {}", sid)
     except Exception as exc:
         logger.error("[ideator] Dynamic generation failed: {}", exc, exc_info=True)
+        raise
+        raise
     await db.close_pool()
     return saved_ids
