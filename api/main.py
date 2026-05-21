@@ -35,6 +35,9 @@ from dashboard_services.intelligence_brief import IntelligenceBriefService
 from validation.sensitivity_analysis import SensitivityAnalyzer
 from validation.regime_testing import RegimeTester
 from strategy_engine.strategy_coder import _validate_code
+from pattern_recognition.pattern_engine import PatternRecognitionEngine
+from strategy_mutation.mutation_engine import StrategyMutationEngine
+from orchestration.self_improvement_orchestrator import SelfImprovementOrchestrator
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +146,14 @@ class SensitivityRequest(BaseModel):
 
 class RegimeValidationRequest(BaseModel):
     regime_metrics: dict
+
+class SelfImprovementCycleRequest(BaseModel):
+    limit: int = 10
+
+class StrategyMutationRequest(BaseModel):
+    mutation_type: str = "parameter_variation"
+    variation_pct: float = 20.0
+    variants: int = 3
 
 class PatternRequest(BaseModel):
     symbol: str
@@ -824,79 +835,12 @@ async def generate_brief():
 @app.post("/api/patterns/detect")
 async def detect_patterns(req: PatternRequest):
     try:
-        rows = await db.fetch(
-            "SELECT timestamp,open,high,low,close,volume FROM market_data WHERE symbol=$1 ORDER BY timestamp DESC LIMIT $2",
-            req.symbol, req.lookback_bars,
+        pool = await db.get_pool()
+        engine = PatternRecognitionEngine(pool)
+        return await engine.detect_for_symbol(
+            symbol=req.symbol,
+            lookback_bars=req.lookback_bars,
         )
-        if not rows:
-            raise HTTPException(404, f"No data for {req.symbol}")
-        import pandas as pd, numpy as np
-        df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        for c in ("open","high","low","close","volume"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        patterns = []
-        close = df["close"]
-
-        # Doji
-        body = abs(df["open"] - close).iloc[-1]
-        rng  = (df["high"] - df["low"]).iloc[-1]
-        if rng > 0 and body / rng < 0.1:
-            patterns.append({"pattern": "doji", "confidence": 0.7})
-
-        # Golden cross
-        if len(df) >= 50:
-            if close.rolling(20).mean().iloc[-1] > close.rolling(50).mean().iloc[-1]:
-                patterns.append({"pattern": "golden_cross_20_50", "confidence": 0.65})
-
-        # RSI
-        d = close.diff()
-        gain = d.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-d.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-        rsi  = 100 - 100 / (1 + gain / loss.replace(0, float("nan")))
-        rsi_now = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
-        if rsi_now < 30:
-            patterns.append({"pattern": "rsi_oversold", "rsi": round(rsi_now, 2), "confidence": 0.8})
-        elif rsi_now > 70:
-            patterns.append({"pattern": "rsi_overbought", "rsi": round(rsi_now, 2), "confidence": 0.8})
-
-        # Fallback market-state pattern so PATT-001 always returns interpretable output
-        if not patterns:
-            recent_close = float(close.iloc[-1])
-            prior_close = float(close.iloc[max(0, len(close) - 21)])
-            pct_change = ((recent_close - prior_close) / prior_close * 100) if prior_close else 0.0
-            avg_range = float((df["high"] - df["low"]).tail(20).mean())
-            avg_volume = float(df["volume"].tail(20).mean())
-
-            if pct_change > 1:
-                state = "bullish_drift"
-                description = "Price has moved higher over the recent lookback without triggering a classic reversal pattern."
-                confidence = 0.62
-            elif pct_change < -1:
-                state = "bearish_drift"
-                description = "Price has moved lower over the recent lookback without triggering a classic reversal pattern."
-                confidence = 0.62
-            else:
-                state = "range_consolidation"
-                description = "Price is consolidating in a narrow range without a strong directional breakout."
-                confidence = 0.6
-
-            patterns.append({
-                "pattern": state,
-                "description": description,
-                "confidence": confidence,
-                "supporting_data": {
-                    "recent_close": round(recent_close, 4),
-                    "prior_close": round(prior_close, 4),
-                    "pct_change_20_bars": round(pct_change, 4),
-                    "avg_range_20_bars": round(avg_range, 4),
-                    "avg_volume_20_bars": round(avg_volume, 4),
-                    "bars_analysed": len(df),
-                },
-            })
-
-        return {"symbol": req.symbol, "patterns": patterns, "bars_analysed": len(df)}
     except HTTPException:
         raise
     except Exception as exc:
@@ -1171,6 +1115,31 @@ async def validate_generated_strategy(strategy_id: str):
                 "get_metadata",
             ],
         }
+
+
+
+# ── Day 5: Strategy Mutation (GEN-005) ────────────────────────────────────────
+
+@app.post("/api/strategies/{strategy_id}/mutate")
+async def mutate_strategy(strategy_id: str, req: StrategyMutationRequest):
+    pool = await db.get_pool()
+    engine = StrategyMutationEngine(pool)
+    return await engine.mutate_strategy(
+        strategy_id=strategy_id,
+        mutation_type=req.mutation_type,
+        variation_pct=req.variation_pct,
+        variants=req.variants,
+    )
+
+
+
+# ── Day 5: Self-Improvement Cycle ─────────────────────────────────────────────
+
+@app.post("/api/self-improvement/run-cycle")
+async def run_self_improvement_cycle(req: SelfImprovementCycleRequest):
+    pool = await db.get_pool()
+    orchestrator = SelfImprovementOrchestrator(pool)
+    return await orchestrator.run_cycle(limit=req.limit)
 
 
 
