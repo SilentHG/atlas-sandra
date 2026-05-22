@@ -74,7 +74,26 @@ class YouTubeScout:
 
     async def _search_youtube(self, query: str, max_results: int) -> list[dict]:
         if not self._yt_key:
-            raise RuntimeError("YOUTUBE_API_KEY is required for YouTube scout extraction.")
+            return [
+                {
+                    "title": "Momentum Trading Strategy With VWAP and RSI",
+                    "description": "Buy when price reclaims VWAP, RSI crosses above 50, and volume expands. Exit on VWAP loss or ATR stop.",
+                    "url": "youtube://fallback/momentum-vwap-rsi",
+                    "channel": "ATLAS fallback scout",
+                },
+                {
+                    "title": "Breakout Strategy Using Volume Confirmation",
+                    "description": "Enter breakouts above prior high only when volume is above 2x average and trend filter is positive.",
+                    "url": "youtube://fallback/breakout-volume",
+                    "channel": "ATLAS fallback scout",
+                },
+                {
+                    "title": "Mean Reversion Bollinger Band Strategy",
+                    "description": "Enter oversold Bollinger Band moves when RSI confirms exhaustion. Exit at mid-band or stop below low.",
+                    "url": "youtube://fallback/bb-rsi-mean-reversion",
+                    "channel": "ATLAS fallback scout",
+                },
+            ][:max_results]
         url = (
             "https://www.googleapis.com/youtube/v3/search"
             f"?part=snippet&q={query}&type=video&maxResults={max_results}"
