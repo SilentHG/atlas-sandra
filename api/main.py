@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel
 
@@ -53,6 +54,8 @@ async def lifespan(app: FastAPI):
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ATLAS Trading API", version="3.0.0", lifespan=lifespan)
+app.mount("/dashboard", StaticFiles(directory="dashboard_static", html=True), name="dashboard")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
