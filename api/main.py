@@ -797,8 +797,14 @@ async def test_scout(req: ScoutTestRequest):
                 query=req.query,
                 max_results=req.max_results,
             )
+        elif source == "discord":
+            from scouts.discord_scout import DiscordScout
+
+            scout = DiscordScout()
+            await scout.setup()
+            hypotheses = await scout.scan_messages()
         else:
-            raise HTTPException(400, "source must be 'reddit' or 'youtube'")
+            raise HTTPException(400, "source must be 'reddit', 'youtube', or 'discord'")
 
         return {
             "status": "completed",
