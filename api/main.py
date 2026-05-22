@@ -97,6 +97,17 @@ class SimulatePnlRequest(BaseModel):
     loss_usd: float
     weekly_loss_usd: float = 0.0
 
+class BatchGenerateStrategyRequest(BaseModel):
+    count: int = 10
+    asset_classes: list[str] = ["us_equities", "crypto"]
+    styles: list[str] = ["momentum", "mean_reversion", "breakout"]
+    timeframes: list[str] = ["5m", "15m", "1h"]
+    symbols_by_asset_class: dict = {
+        "us_equities": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"],
+        "crypto": ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    }
+    lookback_days: int = 90
+
 class GenerateStrategyRequest(BaseModel):
     strategy_type: str = "trend"
     symbols: list[str] = ["AAPL", "MSFT"]
@@ -1047,6 +1058,76 @@ async def generate_daily_intelligence_brief():
     pool = await db.get_pool()
     service = IntelligenceBriefService(pool)
     return await service.generate_brief()
+
+
+
+# ── Strategy Batch Generation (GEN-004) ───────────────────────────────────────
+
+@app.post("/api/strategies/batch-generate")
+async def batch_generate_strategies(req: BatchGenerateStrategyRequest):
+    from itertools import cycle
+
+    generated = []
+    failed = []
+
+    asset_cycle = cycle(req.asset_classes)
+    style_cycle = cycle(req.styles)
+    timeframe_cycle = cycle(req.timeframes)
+
+    for i in range(req.count):
+        asset_class = next(asset_cycle)
+        style = next(style_cycle)
+        timeframe = next(timeframe_cycle)
+        symbols = req.symbols_by_asset_class.get(asset_class, ["AAPL"])
+
+        last_error = None
+        success = False
+
+        for attempt in range(1, 4):
+            try:
+                payload = GenerateStrategyRequest(
+                    asset_class=asset_class,
+                    symbols=symbols,
+                    timeframe=timeframe,
+                    style=style,
+                    lookback_days=req.lookback_days,
+                    custom_prompt=(
+                        "Return STRICT valid JSON only. No markdown. No trailing commentary. "
+                        "Use double quotes for all keys and strings. Ensure the JSON object is fully closed."
+                    ),
+                )
+                result = await generate_strategy(payload)
+
+                generated.append({
+                    "index": i + 1,
+                    "attempt": attempt,
+                    "asset_class": asset_class,
+                    "style": style,
+                    "timeframe": timeframe,
+                    "result": result,
+                })
+                success = True
+                break
+            except Exception as exc:
+                last_error = str(exc)
+
+        if not success:
+            failed.append({
+                "index": i + 1,
+                "asset_class": asset_class,
+                "style": style,
+                "timeframe": timeframe,
+                "error": last_error,
+            })
+
+    return {
+        "status": "ok" if not failed else "partial",
+        "requested_count": req.count,
+        "generated_count": len(generated),
+        "failed_count": len(failed),
+        "generated": generated,
+        "failed": failed,
+    }
 
 
 
