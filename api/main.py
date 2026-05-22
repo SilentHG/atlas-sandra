@@ -1026,6 +1026,44 @@ async def stream_signals(request: Request):
     )
 
 
+@app.get("/api/market-data/{symbol}")
+async def get_market_data(symbol: str, limit: int = 100):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT timestamp, open, high, low, close, volume
+            FROM market_data
+            WHERE symbol = $1
+            ORDER BY timestamp DESC
+            LIMIT $2
+            """,
+            symbol.upper(),
+            limit,
+        )
+
+        data = [
+            {
+                "timestamp": r["timestamp"].isoformat(),
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": float(r["volume"]),
+            }
+            for r in reversed(rows)
+        ]
+
+        return {
+            "status": "ok",
+            "symbol": symbol.upper(),
+            "count": len(data),
+            "data": data,
+        }
+    except Exception as exc:
+        logger.error("[api] market_data error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
 # ── Day 4: Copy Trading ───────────────────────────────────────────────────────
 
 @app.post("/api/copy-trading/link")

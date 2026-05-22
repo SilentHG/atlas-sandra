@@ -118,13 +118,38 @@ async function getJson(url, options={}){const r=await fetch(url,options);return 
 function post(url, body){return getJson(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
 function item(title, text, cls=''){return `<div class="item"><strong class="${cls}">${title}</strong><div class="muted">${text}</div></div>`}
 
-function renderChart(){
+async function renderChart(){
   const ctx=document.getElementById('marketChart');
-  const labels=[...Array(40)].map((_,i)=>i);
-  let price=100;
-  const data=labels.map(()=>{price+=Math.random()*4-1.6;return price.toFixed(2)});
+  const market=await getJson('/api/market-data/AAPL?limit=100');
+  const rows=market.data || [];
+  const labels=rows.map(r => new Date(r.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  const data=rows.map(r => r.close);
+
   if(chart) chart.destroy();
-  chart=new Chart(ctx,{type:'line',data:{labels,datasets:[{label:'ATLAS Market Signal',data,borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,.12)',fill:true,tension:.35,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#cbd5e1'}}},scales:{x:{ticks:{color:'#64748b'},grid:{color:'#111827'}},y:{ticks:{color:'#64748b'},grid:{color:'#111827'}}}}});
+  chart=new Chart(ctx,{
+    type:'line',
+    data:{
+      labels,
+      datasets:[{
+        label:'AAPL Live Close Price',
+        data,
+        borderColor:'#22c55e',
+        backgroundColor:'rgba(34,197,94,.12)',
+        fill:true,
+        tension:.35,
+        pointRadius:0
+      }]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      plugins:{legend:{labels:{color:'#cbd5e1'}}},
+      scales:{
+        x:{ticks:{color:'#64748b', maxTicksLimit:8},grid:{color:'#111827'}},
+        y:{ticks:{color:'#64748b'},grid:{color:'#111827'}}
+      }
+    }
+  });
 }
 
 async function load(){
@@ -162,7 +187,7 @@ async function load(){
   ).join('') || item('Stable', 'No improvement actions pending.','green');
 
   document.getElementById('updated').textContent='Last updated: '+new Date().toLocaleString();
-  renderChart();
+  await renderChart();
 }
 load();
 setInterval(load,15000);
