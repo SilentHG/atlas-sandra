@@ -149,6 +149,7 @@ class CopyTradingMirrorRequest(BaseModel):
     leader_equity: float = 100000
     follower_equity: float = 25000
     price: float = 100
+    fill_ratio: float = 1.0
 
 class SensitivityRequest(BaseModel):
     baseline_metrics: dict
@@ -1036,6 +1037,7 @@ async def mirror_copy_trade_test(req: CopyTradingMirrorRequest):
         leader_equity=req.leader_equity,
         follower_equity=req.follower_equity,
         price=req.price,
+        fill_ratio=req.fill_ratio,
     )
     return result
 
