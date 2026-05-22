@@ -90,6 +90,9 @@ class OrderRequest(BaseModel):
     side: str                       # "buy" | "sell"
     order_type: str = "market"
     limit_price: float | None = None
+    price: float | None = None
+    broker: str = "alpaca"
+    test_only: bool = False
     strategy_id: str | None = None
     stop_loss: float | None = None
 
@@ -756,6 +759,22 @@ async def spawn_agent(req: SpawnAgentRequest):
 @app.post("/api/execution/test-order")
 async def test_order(req: OrderRequest):
     try:
+        broker = req.broker.lower().strip()
+
+        if broker == "binance_testnet":
+            from execution.binance_testnet_executor import BinanceTestnetExecutor
+
+            executor = BinanceTestnetExecutor()
+            result = await executor.submit_order(
+                symbol=req.symbol,
+                qty=req.qty,
+                side=req.side,
+                order_type=req.order_type,
+                price=req.price if req.price is not None else req.limit_price,
+                test_only=req.test_only,
+            )
+            return {"status": "submitted" if result.get("accepted") else "rejected", "order": result}
+
         from execution.alpaca_executor import AlpacaExecutor
         executor = AlpacaExecutor()
         await executor.setup()
