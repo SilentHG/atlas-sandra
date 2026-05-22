@@ -398,6 +398,111 @@ def _compute_features(df: pd.DataFrame, symbol: str) -> dict[str, tuple[float, d
             ranging = max(0.0, 1.0 - (st20 / s20) * 20)
             _safe(ranging, "ranging_score", {"window": 20, "type": "RANGING"})
 
+
+    # 22. Expanded feature pack for 100+ feature target
+    # Moving averages
+    for p in (3, 8, 13, 34, 89, 144):
+        if n >= p:
+            sma = close.rolling(p).mean().iloc[-1]
+            ema = close.ewm(span=p, adjust=False).mean().iloc[-1]
+            _safe(sma, f"sma_{p}", {"window": p, "type": "SMA_EXPANDED"})
+            _safe(ema, f"ema_{p}", {"window": p, "type": "EMA_EXPANDED"})
+            if sma and sma != 0:
+                _safe((close.iloc[-1] - sma) / sma * 100, f"dist_sma{p}_pct", {"window": p, "type": "DIST_SMA_EXPANDED"})
+            if ema and ema != 0:
+                _safe((close.iloc[-1] - ema) / ema * 100, f"dist_ema{p}_pct", {"window": p, "type": "DIST_EMA_EXPANDED"})
+
+    # Multi-window returns / momentum
+    for p in (1, 2, 3, 5, 10, 15, 20, 30, 60):
+        if n > p:
+            prev = close.iloc[-(p + 1)]
+            if prev and prev != 0:
+                _safe((close.iloc[-1] - prev) / prev * 100, f"return_{p}", {"window": p, "type": "RETURN"})
+                _safe(abs((close.iloc[-1] - prev) / prev * 100), f"abs_return_{p}", {"window": p, "type": "ABS_RETURN"})
+
+    # Candle anatomy
+    cur_open = df["open"].iloc[-1]
+    cur_high = high.iloc[-1]
+    cur_low = low.iloc[-1]
+    cur_close = close.iloc[-1]
+    cur_range = cur_high - cur_low
+    body = cur_close - cur_open
+    abs_body = abs(body)
+    upper_wick = cur_high - max(cur_open, cur_close)
+    lower_wick = min(cur_open, cur_close) - cur_low
+
+    _safe(body, "candle_body", {"type": "CANDLE"})
+    _safe(abs_body, "candle_abs_body", {"type": "CANDLE"})
+    _safe(upper_wick, "upper_wick", {"type": "CANDLE"})
+    _safe(lower_wick, "lower_wick", {"type": "CANDLE"})
+    if cur_range and cur_range != 0:
+        _safe(abs_body / cur_range, "body_to_range", {"type": "CANDLE_RATIO"})
+        _safe(upper_wick / cur_range, "upper_wick_to_range", {"type": "CANDLE_RATIO"})
+        _safe(lower_wick / cur_range, "lower_wick_to_range", {"type": "CANDLE_RATIO"})
+        _safe((cur_close - cur_low) / cur_range, "close_location_value", {"type": "CLV"})
+    _safe(1.0 if body > 0 else -1.0 if body < 0 else 0.0, "candle_direction", {"type": "CANDLE_DIRECTION"})
+
+    # Volume features
+    for p in (10, 20, 50, 100):
+        if n >= p:
+            vmean = volume.rolling(p).mean().iloc[-1]
+            vstd = volume.rolling(p).std(ddof=1).iloc[-1]
+            _safe(vmean, f"volume_sma_{p}", {"window": p, "type": "VOLUME_SMA"})
+            if vmean and vmean != 0:
+                _safe(volume.iloc[-1] / vmean, f"volume_ratio_{p}", {"window": p, "type": "VOLUME_RATIO"})
+            if vstd and vstd != 0:
+                _safe((volume.iloc[-1] - vmean) / vstd, f"volume_zscore_{p}", {"window": p, "type": "VOLUME_ZSCORE"})
+
+    # Volatility / range expansion
+    for p in (5, 10, 20, 50):
+        if n >= p:
+            ranges = high - low
+            avg_range = ranges.rolling(p).mean().iloc[-1]
+            std_range = ranges.rolling(p).std(ddof=1).iloc[-1]
+            _safe(avg_range, f"avg_range_{p}", {"window": p, "type": "AVG_RANGE"})
+            if avg_range and avg_range != 0:
+                _safe(cur_range / avg_range, f"range_expansion_{p}", {"window": p, "type": "RANGE_EXPANSION"})
+            if std_range and std_range != 0:
+                _safe((cur_range - avg_range) / std_range, f"range_zscore_{p}", {"window": p, "type": "RANGE_ZSCORE"})
+
+    # Rolling z-scores
+    for p in (10, 20, 50):
+        if n >= p:
+            mean = close.rolling(p).mean().iloc[-1]
+            std = close.rolling(p).std(ddof=1).iloc[-1]
+            if std and std != 0:
+                _safe((close.iloc[-1] - mean) / std, f"close_zscore_{p}", {"window": p, "type": "CLOSE_ZSCORE"})
+
+    # Trend slopes
+    for p in (5, 10, 20, 50):
+        if n >= p:
+            window = close.tail(p).reset_index(drop=True)
+            x = np.arange(len(window))
+            slope = np.polyfit(x, window, 1)[0]
+            _safe(slope, f"slope_close_{p}", {"window": p, "type": "SLOPE"})
+            if window.iloc[0] and window.iloc[0] != 0:
+                _safe(slope / window.iloc[0] * 100, f"slope_close_{p}_pct", {"window": p, "type": "SLOPE_PCT"})
+
+    # Drawdown / distance from rolling highs/lows
+    for p in (10, 20, 50):
+        if n >= p:
+            roll_high = high.rolling(p).max().iloc[-1]
+            roll_low = low.rolling(p).min().iloc[-1]
+            if roll_high and roll_high != 0:
+                _safe((close.iloc[-1] - roll_high) / roll_high * 100, f"dist_high_{p}_pct", {"window": p, "type": "DIST_HIGH"})
+            if roll_low and roll_low != 0:
+                _safe((close.iloc[-1] - roll_low) / roll_low * 100, f"dist_low_{p}_pct", {"window": p, "type": "DIST_LOW"})
+
+    # Microstructure-style proxies
+    if n >= 2:
+        prev_close = close.iloc[-2]
+        if prev_close and prev_close != 0:
+            _safe((cur_close - prev_close) / prev_close * 100, "last_bar_return", {"type": "LAST_BAR_RETURN"})
+        _safe(volume.iloc[-1] * cur_close, "dollar_volume", {"type": "DOLLAR_VOLUME"})
+        if cur_range and cur_range != 0:
+            _safe(volume.iloc[-1] / cur_range, "volume_per_range", {"type": "VOLUME_PER_RANGE"})
+
+
     return features
 
 
