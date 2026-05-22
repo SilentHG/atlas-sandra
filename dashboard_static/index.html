@@ -44,14 +44,14 @@ h2{margin:0 0 14px;font-size:18px}
   <aside class="sidebar">
     <div class="logo">ATLAS<span>AI</span></div>
     <div class="nav">
-      <div class="active">Command Center</div>
-      <div>Strategies</div>
-      <div>Market Data</div>
-      <div>Pattern Engine</div>
-      <div>Scout Network</div>
-      <div>Copy Trading</div>
-      <div>Risk Controls</div>
-      <div>System Logs</div>
+      <div class="active" onclick="switchView('command')">Command Center</div>
+      <div onclick="switchView('strategies')">Strategies</div>
+      <div onclick="switchView('market')">Market Data</div>
+      <div onclick="switchView('patterns')">Pattern Engine</div>
+      <div onclick="switchView('scouts')">Scout Network</div>
+      <div onclick="switchView('copy')">Copy Trading</div>
+      <div onclick="switchView('risk')">Risk Controls</div>
+      <div onclick="switchView('logs')">System Logs</div>
     </div>
   </aside>
 
@@ -64,6 +64,7 @@ h2{margin:0 0 14px;font-size:18px}
       <div class="live" id="badge">LIVE DATA</div>
     </div>
 
+    <div id="pageTitleBlock">
     <section class="metrics">
       <div class="card"><div class="label">System Health</div><div class="value green" id="health">--</div></div>
       <div class="card"><div class="label">Strategies</div><div class="value blue" id="strategies">--</div></div>
@@ -108,6 +109,10 @@ h2{margin:0 0 14px;font-size:18px}
       </div>
     </section>
 
+    </div>
+
+    <section id="dynamicView" style="display:none"></section>
+
     <div class="footer" id="updated">Last updated: --</div>
   </main>
 </div>
@@ -150,6 +155,108 @@ async function renderChart(){
       }
     }
   });
+}
+
+
+function setActiveNav(label){
+  document.querySelectorAll('.nav div').forEach(el=>{
+    el.classList.toggle('active', el.textContent.trim() === label);
+  });
+}
+
+function showMain(){
+  document.getElementById('pageTitleBlock').style.display='block';
+  document.getElementById('dynamicView').style.display='none';
+}
+
+async function switchView(view){
+  const box=document.getElementById('dynamicView');
+  const main=document.getElementById('pageTitleBlock');
+  main.style.display='none';
+  box.style.display='block';
+
+  if(view==='command'){
+    setActiveNav('Command Center');
+    showMain();
+    return;
+  }
+
+  if(view==='strategies'){
+    setActiveNav('Strategies');
+    const strategies=await getJson('/api/strategies');
+    box.innerHTML=`<div class="card full"><h2>Strategies</h2>
+      <table class="table"><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Created</th></tr></thead>
+      <tbody>${strategies.map(s=>`<tr><td>${s.name}</td><td>${s.strategy_type}</td><td><span class="pill">${s.status}</span></td><td>${s.created_at||''}</td></tr>`).join('')}</tbody>
+      </table></div>`;
+  }
+
+  if(view==='market'){
+    setActiveNav('Market Data');
+    const data=await getJson('/api/market-data/AAPL?limit=50');
+    box.innerHTML=`<div class="card full"><h2>Market Data: AAPL</h2>
+      <table class="table"><thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
+      <tbody>${data.data.map(r=>`<tr><td>${new Date(r.timestamp).toLocaleString()}</td><td>${r.open}</td><td>${r.high}</td><td>${r.low}</td><td>${r.close}</td><td>${Math.round(r.volume)}</td></tr>`).join('')}</tbody>
+      </table></div>`;
+  }
+
+  if(view==='patterns'){
+    setActiveNav('Pattern Engine');
+    const p=await post('/api/patterns/detect',{symbol:'AAPL',lookback_bars:120});
+    box.innerHTML=`<div class="card full"><h2>Pattern Engine</h2>
+      ${(p.patterns||[]).map(x=>item(x.pattern, `${x.description||''} Confidence: ${x.confidence||'n/a'}`, 'green')).join('') || item('No Pattern','No active pattern detected')}</div>`;
+  }
+
+  if(view==='scouts'){
+    setActiveNav('Scout Network');
+    const d=await post('/api/scouts/test',{source:'discord',limit:3});
+    const r=await post('/api/scouts/test',{source:'reddit',subreddits:['algotrading'],limit:3});
+    const y=await post('/api/scouts/test',{source:'youtube',query:'momentum trading strategy',max_results:3});
+    box.innerHTML=`<div class="card full"><h2>Scout Network</h2>
+      ${item('Discord Scout', `${d.count} hypotheses`, 'green')}
+      ${item('Reddit Scout', `${r.count} hypotheses`, 'green')}
+      ${item('YouTube Scout', `${y.count} hypotheses`, 'green')}
+      </div>`;
+  }
+
+  if(view==='copy'){
+    setActiveNav('Copy Trading');
+    const c=await post('/api/copy-trading/mirror-test',{
+      leader_account:'leader_latency_test',
+      leader_order_id:'dashboard-copy-test',
+      symbol:'AAPL',
+      side:'buy',
+      leader_qty:10,
+      leader_equity:100000,
+      follower_equity:25000,
+      price:100,
+      fill_ratio:0.5
+    });
+    box.innerHTML=`<div class="card full"><h2>Copy Trading</h2>
+      ${item('Followers Found', c.followers_found, 'blue')}
+      ${(c.events||[]).map(e=>item(e.status, `Follower Qty: ${e.follower_qty} | Latency: ${e.latency_ms}ms | Fill Ratio: ${e.fill_ratio}`, 'green')).join('')}
+      </div>`;
+  }
+
+  if(view==='risk'){
+    setActiveNav('Risk Controls');
+    const health=await getJson('/health');
+    box.innerHTML=`<div class="card full"><h2>Risk Controls</h2>
+      ${item('Kill Switch', health.services?.kill_switch || 'unknown', 'gold')}
+      ${item('System Health', health.status || 'unknown', 'green')}
+      ${item('Market Feed', health.services?.last_data_timestamp?.status || 'unknown', 'green')}
+      </div>`;
+  }
+
+  if(view==='logs'){
+    setActiveNav('System Logs');
+    const health=await getJson('/health');
+    box.innerHTML=`<div class="card full"><h2>System Logs</h2>
+      ${item('API', 'FastAPI service online', 'green')}
+      ${item('Database', health.services?.timescaledb || 'unknown', 'green')}
+      ${item('Feature Store', health.services?.feature_store?.status || 'unknown', 'green')}
+      ${item('Last Data Timestamp', health.services?.last_data_timestamp?.timestamp || 'unknown', 'blue')}
+      </div>`;
+  }
 }
 
 async function load(){
