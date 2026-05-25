@@ -2,14 +2,15 @@
 ATLAS Backtest Engine — backtesting/backtest_engine.py
 =======================================================
 Reads historical OHLCV from TimescaleDB, applies a strategy,
-enforces train/test/holdout splits (60/20/20) with zero data
-leakage, models slippage + commission, and saves to backtests table.
+enforces a 70/30 backtest/Monte Carlo split with zero data
+leakage, models slippage + commission, creates daily equity curves,
+and saves to backtests table.
 """
 from __future__ import annotations
 
 import json, uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import numpy as np
@@ -21,15 +22,16 @@ from database import connection as db
 # ── Config ─────────────────────────────────────────────────────────────────────
 SLIPPAGE_BASE    = 0.001    # 0.1% per trade
 COMMISSION_USD   = 1.0      # $1 per trade
-TRAIN_FRAC       = 0.60
-TEST_FRAC        = 0.20
-# holdout = remaining 20%
+MIN_HISTORY_DAYS = 730
+BACKTEST_FRAC    = 0.70
+MONTE_CARLO_FRAC = 0.30
+MONTE_CARLO_RUNS = 500
 
 @dataclass
 class BacktestResult:
     strategy_id:        str
     symbol:             str
-    split:              str   # "train" | "test" | "holdout"
+    split:              str   # "backtest" | "monte_carlo"
     start_date:         datetime
     end_date:           datetime
     total_trades:       int   = 0
@@ -88,11 +90,15 @@ class BacktestEngine:
     # ── Splits ────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        n     = len(df)
-        i_tr  = int(n * TRAIN_FRAC)
-        i_te  = int(n * (TRAIN_FRAC + TEST_FRAC))
-        return df.iloc[:i_tr], df.iloc[i_tr:i_te], df.iloc[i_te:]
+    def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Buyer requirement:
+        - First 70% of historical data is used for the initial backtest.
+        - Remaining 30% is reserved for Monte Carlo validation.
+        """
+        n = len(df)
+        i_bt = int(n * BACKTEST_FRAC)
+        return df.iloc[:i_bt], df.iloc[i_bt:]
 
     # ── Signal generation ─────────────────────────────────────────────────────
 
@@ -108,6 +114,87 @@ class BacktestEngine:
         df.loc[df["ema_fast"] < df["ema_slow"], "signal"]  = -1
         df["pos_change"] = df["signal"].diff().fillna(0)
         return df
+
+    @staticmethod
+    def _daily_equity_curve(equity: list[dict]) -> list[dict]:
+        """
+        Convert per-bar/minute equity curve into one end-of-day equity point.
+        """
+        if not equity:
+            return []
+
+        eq_df = pd.DataFrame(equity)
+        eq_df["t"] = pd.to_datetime(eq_df["t"], utc=True, errors="coerce")
+        eq_df["v"] = pd.to_numeric(eq_df["v"], errors="coerce")
+        eq_df = eq_df.dropna(subset=["t", "v"])
+
+        if eq_df.empty:
+            return []
+
+        daily = (
+            eq_df.set_index("t")
+            .resample("1D")
+            .last()
+            .dropna()
+            .reset_index()
+        )
+
+        return [
+            {"t": r["t"].date().isoformat(), "v": round(float(r["v"]), 2)}
+            for _, r in daily.iterrows()
+        ]
+
+    @staticmethod
+    def _monte_carlo_from_equity(
+        equity_curve: list[dict],
+        runs: int = MONTE_CARLO_RUNS,
+    ) -> dict[str, Any]:
+        """
+        Monte Carlo validation using daily equity returns from the reserved 30%.
+        Resamples daily returns to estimate drawdown and ending capital risk.
+        """
+        if len(equity_curve) < 30:
+            return {
+                "status": "partial",
+                "reason": f"Insufficient daily equity points for Monte Carlo: {len(equity_curve)}",
+                "runs": runs,
+                "daily_points": len(equity_curve),
+            }
+
+        values = pd.Series([float(x["v"]) for x in equity_curve])
+        returns = values.pct_change().dropna()
+
+        if len(returns) < 20 or returns.std() == 0:
+            return {
+                "status": "partial",
+                "reason": "Insufficient non-zero daily return distribution for Monte Carlo",
+                "runs": runs,
+                "daily_points": len(equity_curve),
+            }
+
+        start_capital = values.iloc[0]
+        simulations = []
+        max_drawdowns = []
+
+        for _ in range(runs):
+            sampled = returns.sample(n=len(returns), replace=True).reset_index(drop=True)
+            path = start_capital * (1 + sampled).cumprod()
+            peak = path.cummax()
+            dd = ((path - peak) / peak).min()
+            simulations.append(float(path.iloc[-1]))
+            max_drawdowns.append(float(dd))
+
+        return {
+            "status": "pass",
+            "runs": runs,
+            "daily_points": len(equity_curve),
+            "ending_capital_p05": round(float(np.percentile(simulations, 5)), 4),
+            "ending_capital_p50": round(float(np.percentile(simulations, 50)), 4),
+            "ending_capital_p95": round(float(np.percentile(simulations, 95)), 4),
+            "max_drawdown_p05": round(float(np.percentile(max_drawdowns, 5)), 6),
+            "max_drawdown_p50": round(float(np.percentile(max_drawdowns, 50)), 6),
+            "max_drawdown_p95": round(float(np.percentile(max_drawdowns, 95)), 6),
+        }
 
     # ── P&L simulation ────────────────────────────────────────────────────────
 
@@ -160,7 +247,7 @@ class BacktestEngine:
                 end_date=df["timestamp"].iloc[-1],
                 initial_capital=self._capital,
                 final_capital=capital,
-                equity_curve=equity[-200:],
+                equity_curve=self._daily_equity_curve(equity),
             )
 
         wins   = [t for t in trades if t["win"]]
@@ -201,7 +288,7 @@ class BacktestEngine:
             avg_trade_duration=round(np.mean([t["bars"] for t in trades]), 2),
             initial_capital=self._capital,
             final_capital=round(capital, 4),
-            equity_curve=equity[-200:],
+            equity_curve=self._daily_equity_curve(equity),
         )
         return r
 
@@ -217,24 +304,55 @@ class BacktestEngine:
         qty:         float = 10.0,
     ) -> dict[str, BacktestResult]:
         logger.info("[backtest] {} {} → {}", symbol, start.date(), end.date())
+        # Buyer requirement: enforce at least 2 years of historical coverage.
+        requested_days = (end - start).days
+        if requested_days < MIN_HISTORY_DAYS:
+            start = end - timedelta(days=MIN_HISTORY_DAYS)
+            logger.info(
+                "[backtest] Expanded requested range to minimum 2 years: {} → {}",
+                start.date(), end.date(),
+            )
+
         df = await self._load_ohlcv(symbol, start, end)
         if df.empty or len(df) < 50:
             raise ValueError(f"Insufficient data for {symbol}: {len(df)} bars")
 
+        actual_days = max((df["timestamp"].max() - df["timestamp"].min()).days, 0)
+        if actual_days < MIN_HISTORY_DAYS:
+            raise ValueError(
+                f"Minimum 2 years historical data required for {symbol}. "
+                f"Found {actual_days} days from {df['timestamp'].min()} to {df['timestamp'].max()}."
+            )
+
         df = self._compute_signals(df)
-        train_df, test_df, holdout_df = self._split(df)
+        backtest_df, monte_carlo_df = self._split(df)
 
         results: dict[str, BacktestResult] = {}
         for split_name, split_df in [
-            ("train", train_df), ("test", test_df), ("holdout", holdout_df)
+            ("backtest", backtest_df),
+            ("monte_carlo", monte_carlo_df),
         ]:
-            if len(split_df) < 5:
+            if len(split_df) < 30:
                 continue
+
             r = self._simulate(split_df.reset_index(drop=True), qty=qty)
             r.strategy_id = strategy_id
             r.symbol      = symbol
             r.split       = split_name
             r.parameters  = parameters or {}
+
+            if split_name == "monte_carlo":
+                r.parameters = {
+                    **(parameters or {}),
+                    "monte_carlo": self._monte_carlo_from_equity(r.equity_curve),
+                    "split_policy": "70% initial backtest / 30% Monte Carlo",
+                }
+            else:
+                r.parameters = {
+                    **(parameters or {}),
+                    "split_policy": "70% initial backtest / 30% Monte Carlo",
+                }
+
             results[split_name] = r
             logger.info(
                 "[backtest] {} {} | trades={} net={:.2f} sharpe={:.3f} dd={:.2%}",

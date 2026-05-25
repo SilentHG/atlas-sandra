@@ -7,11 +7,14 @@ extracts hypotheses using Claude.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 from anthropic import Anthropic
+from youtube_transcript_api import YouTubeTranscriptApi
 from loguru import logger
 
 from config.settings import settings
@@ -32,20 +35,63 @@ CREATE TABLE IF NOT EXISTS strategy_hypotheses (
 );
 """
 
-_EXTRACT_PROMPT = """You are a systematic trading researcher.
-Given the following video title and description, extract a trading strategy hypothesis.
+_SUMMARY_PROMPT = """You are a trading research assistant.
+Summarize the following YouTube transcript into the core trading idea only.
 
-Source: {title}
-Description: {description}
+Rules:
+- Focus on the strategy logic from the video content.
+- Ignore promotions, disclaimers, intros, links, and filler.
+- Extract market, setup, indicators, entry logic, exit logic, risk logic.
+- Keep it concise.
+
+Title: {title}
+
+Transcript:
+{transcript}
+"""
+
+_EXTRACT_PROMPT = """You are a systematic trading researcher.
+
+Primary source:
+The strategy idea MUST come from the YouTube transcript summary below.
+
+Reference only:
+ATLAS feature names, indicators, and feature-store context may be used only as supporting references. Do not invent a strategy from features alone.
+
+Video title: {title}
+Transcript summary:
+{summary}
+
+Reference features available:
+{features_reference}
 
 Return a JSON object with these fields ONLY:
 {{
-  "description": "brief strategy description",
+  "description": "brief strategy description based on the video transcript",
   "entry_rules": ["rule 1", "rule 2"],
   "exit_rules": ["rule 1", "rule 2"],
   "confidence": 0.0-1.0
 }}
 Return ONLY valid JSON, no markdown."""
+
+
+def _video_id_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.netloc in {"youtube.com", "www.youtube.com"}:
+            return parse_qs(parsed.query).get("v", [None])[0]
+        if parsed.netloc == "youtu.be":
+            return parsed.path.strip("/") or None
+    except Exception:
+        return None
+    return None
+
+
+def _clean_transcript_text(text: str, max_chars: int = 12000) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text[:max_chars]
 
 
 class YouTubeScout:
@@ -108,25 +154,120 @@ class YouTubeScout:
                 "title": item["snippet"]["title"],
                 "description": item["snippet"]["description"],
                 "url": f"https://youtube.com/watch?v={item['id']['videoId']}",
+                "video_id": item["id"]["videoId"],
             }
             for item in data.get("items", [])
         ]
 
-    async def _extract(self, video: dict) -> dict | None:
+    async def _already_seen(self, source_url: str | None) -> bool:
+        if not source_url:
+            return False
+        row = await db.fetchrow(
+            "SELECT id FROM strategy_hypotheses WHERE source = 'youtube' AND source_url = $1 LIMIT 1",
+            source_url,
+        )
+        return row is not None
+
+    async def _get_transcript(self, video: dict) -> str:
+        video_id = video.get("video_id") or _video_id_from_url(video.get("url"))
+        if not video_id:
+            return ""
+
+        def _load() -> str:
+            api = YouTubeTranscriptApi()
+            fetched = api.fetch(video_id, languages=["en"])
+            return " ".join(snippet.text for snippet in fetched)
+
+        import asyncio
+        loop = asyncio.get_running_loop()
         try:
+            raw = await loop.run_in_executor(None, _load)
+            return _clean_transcript_text(raw)
+        except Exception as exc:
+            logger.warning("[youtube_scout] Transcript unavailable for '{}': {}", video.get("title"), exc)
+            return ""
+
+    async def _summarize_transcript(self, title: str, transcript: str) -> str:
+        if not transcript:
+            return ""
+
+        def _call() -> str:
             msg = self._claude.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=512,
+                max_tokens=900,
+                messages=[{
+                    "role": "user",
+                    "content": _SUMMARY_PROMPT.format(title=title, transcript=transcript),
+                }],
+            )
+            return msg.content[0].text.strip()
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _call)
+
+    async def _feature_reference(self) -> str:
+        try:
+            rows = await db.fetch(
+                """
+                SELECT DISTINCT feature_name
+                FROM feature_store
+                WHERE computed_at > NOW() - INTERVAL '30 minutes'
+                ORDER BY feature_name
+                LIMIT 80
+                """
+            )
+            names = [r["feature_name"] for r in rows]
+            return ", ".join(names[:80])
+        except Exception as exc:
+            logger.warning("[youtube_scout] Feature reference unavailable: {}", exc)
+            return "EMA, RSI, MACD, VWAP, ATR, Bollinger Bands, volume, regime, volatility"
+
+    async def _extract(self, video: dict) -> dict | None:
+        try:
+            if await self._already_seen(video.get("url")):
+                logger.info("[youtube_scout] Duplicate skipped: {}", video.get("url"))
+                return None
+
+            transcript = await self._get_transcript(video)
+            transcript_unavailable = False
+
+            if transcript:
+                summary = await self._summarize_transcript(video.get("title", ""), transcript)
+            else:
+                transcript_unavailable = True
+                logger.warning(
+                    "[youtube_scout] No transcript; falling back to title/description for '{}'",
+                    video.get("title"),
+                )
+                summary = (
+                    "Transcript unavailable. Fallback source metadata only. "
+                    f"Title: {video.get('title', '')}. "
+                    f"Description: {video.get('description', '')}"
+                )
+
+            features_reference = await self._feature_reference()
+
+            msg = self._claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=700,
                 messages=[{
                     "role": "user",
                     "content": _EXTRACT_PROMPT.format(
                         title=video["title"],
-                        description=video.get("description", ""),
+                        summary=summary,
+                        features_reference=features_reference,
                     ),
                 }],
             )
             raw = msg.content[0].text.strip()
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
             data = json.loads(raw)
+            video["transcript_summary"] = summary
+            video["transcript_chars_used"] = len(transcript or "")
+            video["transcript_unavailable"] = transcript_unavailable
             return {
                 "source": "youtube",
                 "source_url": video.get("url"),

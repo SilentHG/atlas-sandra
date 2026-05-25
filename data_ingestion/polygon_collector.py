@@ -6,7 +6,7 @@ and persists them to the TimescaleDB `market_data` hypertable.
 
 DATA-001 ZERO GAPS:
   - WebSocket streaming for real-time bars
-  - REST backfill loop every 5 minutes to catch any missed bars
+  - REST backfill loop once per day to catch missed historical bars
   - After every bar saved, check if previous minute exists
   - If gap found, immediately backfill from REST API
   - Only store equities data between 09:30-16:00 ET
@@ -59,7 +59,7 @@ SUBSCRIBE_CHANNELS = [f"AM.{sym}" for sym in EQUITY_SYMBOLS]
 _BACKOFF = wait_exponential(multiplier=1, min=1, max=60)
 
 # REST backfill interval
-_BACKFILL_INTERVAL_S = 300  # 5 minutes
+_BACKFILL_INTERVAL_S = 86400  # once per day
 
 # Market hours in ET
 MARKET_TZ = ZoneInfo("America/New_York")

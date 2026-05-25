@@ -130,3 +130,4 @@ black>=24.4.0
 ruff>=0.4.0
 mypy>=1.10.0
 pre-commit>=3.7.0
+youtube-transcript-api==1.2.4
