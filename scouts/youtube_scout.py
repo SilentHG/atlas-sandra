@@ -7,9 +7,12 @@ extracts hypotheses using Claude.
 from __future__ import annotations
 
 import json
+import subprocess
+import tempfile
 import re
 from datetime import datetime, timezone
 from typing import Any
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import httpx
@@ -170,22 +173,90 @@ class YouTubeScout:
 
     async def _get_transcript(self, video: dict) -> str:
         video_id = video.get("video_id") or _video_id_from_url(video.get("url"))
-        if not video_id:
+        url = video.get("url")
+        if not video_id and not url:
             return ""
 
-        def _load() -> str:
+        def _load_from_transcript_api() -> str:
             api = YouTubeTranscriptApi()
             fetched = api.fetch(video_id, languages=["en"])
             return " ".join(snippet.text for snippet in fetched)
 
+        def _load_from_ytdlp() -> str:
+            """
+            Fallback when YouTubeTranscriptApi is blocked by cloud-provider IPs.
+            Uses yt-dlp to download available English subtitles/auto-subtitles,
+            then strips VTT timing/metadata into plain transcript text.
+            """
+            if not url:
+                return ""
+
+            with tempfile.TemporaryDirectory() as td:
+                outtmpl = str(Path(td) / "%(id)s.%(ext)s")
+                cmd = [
+                    "yt-dlp",
+                    "--write-auto-sub",
+                    "--write-sub",
+                    "--sub-lang", "en",
+                    "--skip-download",
+                    "--sub-format", "vtt",
+                    "-o", outtmpl,
+                    url,
+                ]
+
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=90,
+                )
+
+                if proc.returncode != 0:
+                    raise RuntimeError(proc.stderr.strip()[:800])
+
+                vtt_files = list(Path(td).glob("*.vtt"))
+                if not vtt_files:
+                    return ""
+
+                raw = "\n".join(p.read_text(errors="ignore") for p in vtt_files)
+                lines = []
+                for line in raw.splitlines():
+                    s = line.strip()
+                    if not s:
+                        continue
+                    if s.startswith("WEBVTT") or s.startswith("Kind:") or s.startswith("Language:"):
+                        continue
+                    if "-->" in s:
+                        continue
+                    if s.isdigit():
+                        continue
+                    lines.append(s)
+
+                return " ".join(lines)
+
         import asyncio
         loop = asyncio.get_running_loop()
+
         try:
-            raw = await loop.run_in_executor(None, _load)
-            return _clean_transcript_text(raw)
+            raw = await loop.run_in_executor(None, _load_from_transcript_api)
+            cleaned = _clean_transcript_text(raw)
+            if cleaned:
+                logger.info("[youtube_scout] Transcript loaded via YouTubeTranscriptApi for '{}'", video.get("title"))
+                return cleaned
         except Exception as exc:
-            logger.warning("[youtube_scout] Transcript unavailable for '{}': {}", video.get("title"), exc)
-            return ""
+            logger.warning("[youtube_scout] TranscriptApi failed for '{}': {}", video.get("title"), exc)
+
+        try:
+            raw = await loop.run_in_executor(None, _load_from_ytdlp)
+            cleaned = _clean_transcript_text(raw)
+            if cleaned:
+                logger.info("[youtube_scout] Transcript loaded via yt-dlp for '{}'", video.get("title"))
+                return cleaned
+        except Exception as exc:
+            logger.warning("[youtube_scout] yt-dlp transcript fallback failed for '{}': {}", video.get("title"), exc)
+
+        return ""
 
     async def _summarize_transcript(self, title: str, transcript: str) -> str:
         if not transcript:
