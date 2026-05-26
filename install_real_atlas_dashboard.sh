@@ -1,3 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd ~/atlas-sandra
+mkdir -p dashboard_static/backups
+[ -f dashboard_static/index.html ] && cp dashboard_static/index.html "dashboard_static/backups/index.$(date +%Y%m%d_%H%M%S).html"
+
+cat > dashboard_static/index.html <<'HTML'
 <!doctype html>
 <html lang="en">
 <head>
@@ -19,3 +27,16 @@ const API=location.origin.includes("47.130.131.155")?"http://47.130.131.155:8080
 </script>
 </body>
 </html>
+HTML
+
+pkill -f "uvicorn api.main:app" || true
+sleep 3
+source .venv/bin/activate
+set -a
+source config/keys.env
+set +a
+nohup python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8080 > /tmp/atlas-api.log 2>&1 &
+sleep 5
+
+curl -s http://localhost:8080/health | jq '.status,.services.kill_switch'
+echo "Open: http://47.130.131.155:8080/dashboard/"
