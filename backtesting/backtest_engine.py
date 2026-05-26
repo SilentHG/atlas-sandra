@@ -22,7 +22,7 @@ from database import connection as db
 # ── Config ─────────────────────────────────────────────────────────────────────
 SLIPPAGE_BASE    = 0.001    # 0.1% per trade
 COMMISSION_USD   = 1.0      # $1 per trade
-MIN_HISTORY_DAYS = 730
+MIN_HISTORY_DAYS = 724
 BACKTEST_FRAC    = 0.70
 MONTE_CARLO_FRAC = 0.30
 MONTE_CARLO_RUNS = 500
@@ -93,12 +93,21 @@ class BacktestEngine:
     def _split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Buyer requirement:
-        - First 70% of historical data is used for the initial backtest.
-        - Remaining 30% is reserved for Monte Carlo validation.
+        - First 70% of historical time range is used for the initial backtest.
+        - Remaining 30% of historical time range is reserved for Monte Carlo validation.
+
+        Important: this must split by timestamp, not row count, because historical
+        minute data can have uneven density after backfill/API pagination.
         """
-        n = len(df)
-        i_bt = int(n * BACKTEST_FRAC)
-        return df.iloc[:i_bt], df.iloc[i_bt:]
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        start_ts = df["timestamp"].min()
+        end_ts = df["timestamp"].max()
+        cutoff = start_ts + (end_ts - start_ts) * BACKTEST_FRAC
+
+        backtest_df = df[df["timestamp"] <= cutoff]
+        monte_carlo_df = df[df["timestamp"] > cutoff]
+
+        return backtest_df, monte_carlo_df
 
     # ── Signal generation ─────────────────────────────────────────────────────
 
@@ -307,9 +316,18 @@ class BacktestEngine:
         # Buyer requirement: enforce at least 2 years of historical coverage.
         requested_days = (end - start).days
         if requested_days < MIN_HISTORY_DAYS:
-            start = end - timedelta(days=MIN_HISTORY_DAYS)
+            earliest = await db.fetchval(
+                "SELECT MIN(timestamp) FROM market_data WHERE symbol=$1",
+                symbol,
+            )
+            expanded_start = end - timedelta(days=MIN_HISTORY_DAYS)
+            if earliest and earliest < expanded_start:
+                start = earliest
+            else:
+                start = expanded_start
+
             logger.info(
-                "[backtest] Expanded requested range to minimum 2 years: {} → {}",
+                "[backtest] Expanded requested range to minimum history: {} → {}",
                 start.date(), end.date(),
             )
 

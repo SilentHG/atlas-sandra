@@ -263,12 +263,13 @@ async def _rest_backfill_range(
     from_ts: datetime,
     to_ts: datetime,
     api_key: str,
+    force: bool = False,
 ) -> int:
     """
     Fetch 1-minute bars from Polygon REST API for a specific time range.
     Returns count of bars inserted.
     """
-    if _is_market_open():
+    if _is_market_open() and not force:
         logger.info(
             "[polygon] Market open — skipping REST backfill for {}; WebSocket handles live data",
             symbol,
