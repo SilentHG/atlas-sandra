@@ -757,6 +757,49 @@ async def spawn_agent(req: SpawnAgentRequest):
         logger.error("[api] spawn_agent error: {}", exc)
         raise HTTPException(500, str(exc))
 
+
+# ── Agent Registry Sync ───────────────────────────────────────────────────────
+
+@app.post("/api/agents/sync-processes")
+async def sync_agent_processes():
+    """
+    Sync visible long-running collector/engine processes into agent_registry.
+    This keeps the dashboard accurate even when agents run as standalone modules.
+    """
+    import subprocess
+    from datetime import datetime, timezone
+
+    process_map = {
+        "data_ingestor": ["polygon_collector", "binance_collector"],
+        "feature_engineer": ["feature_engineer"],
+    }
+
+    try:
+        ps = subprocess.check_output(["ps", "aux"], text=True)
+
+        updates = {}
+        for agent, needles in process_map.items():
+            running = any(n in ps and "grep" not in ps for n in needles)
+            updates[agent] = "running" if running else "stopped"
+
+            await db.execute(
+                """
+                UPDATE agent_registry
+                   SET status=$1,
+                       last_heartbeat=CASE WHEN $1='running' THEN NOW() ELSE last_heartbeat END,
+                       updated_at=NOW()
+                 WHERE name=$2
+                """,
+                updates[agent],
+                agent,
+            )
+
+        return {"status": "synced", "agents": updates}
+
+    except Exception as exc:
+        logger.error("[api] sync_agent_processes error: {}", exc)
+        raise HTTPException(500, str(exc))
+
 # ── Execution ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/execution/test-order")
