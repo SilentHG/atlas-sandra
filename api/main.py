@@ -48,6 +48,7 @@ async def lifespan(app: FastAPI):
     ks = get_kill_switch()
     await ks.setup()
     logger.info("[api] ATLAS API ready on :8080")
+    asyncio.create_task(_youtube_scout_auto_loop())
     yield
     await db.close_pool()
 
@@ -217,6 +218,33 @@ def _parse_api_datetime(value: str | None, default: datetime) -> datetime:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
+
+async def _youtube_scout_auto_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            from scouts.youtube_scout import YouTubeScout
+
+            scout = YouTubeScout()
+            await scout.setup()
+            queries = [
+                "algorithmic trading strategy",
+                "VWAP trading strategy",
+                "momentum trading strategy",
+                "mean reversion trading strategy",
+                "crypto trading strategy",
+            ]
+            saved = 0
+            for q in queries:
+                hs = await scout.search_and_extract(query=q, max_results=2)
+                saved += len(hs)
+            logger.info("[youtube_auto] completed scheduled scout run; saved={}", saved)
+        except Exception as exc:
+            logger.warning("[youtube_auto] scheduled scout run failed: {}", exc)
+
+        await asyncio.sleep(6 * 60 * 60)
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -340,6 +368,180 @@ async def list_strategies():
     except Exception as exc:
         logger.error("[api] list_strategies error: {}", exc)
         raise HTTPException(500, str(exc))
+
+
+@app.get("/api/dashboard/strategies-live")
+async def dashboard_strategies_live(limit: int = 60):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT
+              s.id,
+              s.name,
+              s.strategy_type,
+              s.status,
+              s.symbols,
+              s.description,
+              s.created_at,
+              bt.completed_at AS last_backtest_at,
+              bt.sharpe,
+              bt.sortino,
+              bt.max_drawdown,
+              bt.win_rate,
+              bt.profit_factor,
+              bt.total_trades,
+              bt.total_return,
+              bt.annualized_return
+            FROM strategies s
+            LEFT JOIN LATERAL (
+              SELECT *
+              FROM backtests b
+              WHERE b.strategy_id = s.id
+              ORDER BY b.completed_at DESC
+              LIMIT 1
+            ) bt ON TRUE
+            WHERE s.status IN ('active','failed','backtesting','pending','paper_trading','live_ready')
+            ORDER BY
+              CASE
+                WHEN s.status='live_ready' THEN 1
+                WHEN s.status='paper_trading' THEN 2
+                WHEN s.status='active' THEN 3
+                WHEN s.status='backtesting' THEN 4
+                WHEN s.status='pending' THEN 5
+                ELSE 6
+              END,
+              s.created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.error("[api] dashboard_strategies_live error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/api/dashboard/strategy/{strategy_id}/backtests")
+async def dashboard_strategy_backtests(strategy_id: str, limit: int = 20):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT
+              id,
+              symbols,
+              sharpe,
+              sortino,
+              max_drawdown,
+              win_rate,
+              profit_factor,
+              total_trades,
+              total_return,
+              annualized_return,
+              start_date,
+              end_date,
+              completed_at,
+              parameters,
+              equity_curve
+            FROM backtests
+            WHERE strategy_id=$1
+            ORDER BY completed_at DESC
+            LIMIT $2
+            """,
+            strategy_id,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.error("[api] dashboard_strategy_backtests error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+
+@app.post("/api/strategies/{strategy_id}/promote")
+async def promote_strategy(strategy_id: str, req: dict):
+    try:
+        target = str(req.get("target_status") or "").strip()
+
+        allowed = {"paper_trading", "live_ready", "active", "disabled"}
+        if target not in allowed:
+            raise HTTPException(400, f"target_status must be one of {sorted(allowed)}")
+
+        row = await db.fetchrow(
+            """
+            UPDATE strategies
+            SET status=$2, updated_at=NOW()
+            WHERE id=$1
+            RETURNING id,name,status,symbols
+            """,
+            strategy_id,
+            target,
+        )
+
+        if not row:
+            raise HTTPException(404, "Strategy not found")
+
+        return {"status": "promoted", "strategy": dict(row)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[api] promote_strategy error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/strategies/{strategy_id}/paper-trade")
+async def paper_trade_strategy(strategy_id: str, req: dict):
+    try:
+        strategy = await db.fetchrow(
+            "SELECT id,name,status,symbols FROM strategies WHERE id=$1",
+            strategy_id,
+        )
+        if not strategy:
+            raise HTTPException(404, "Strategy not found")
+
+        if strategy["status"] not in ("paper_trading", "live_ready", "active"):
+            raise HTTPException(400, "Strategy must be active or promoted before paper trading")
+
+        symbol = req.get("symbol")
+        if not symbol:
+            symbols = strategy["symbols"] or []
+            symbol = symbols[0] if symbols else "AAPL"
+
+        side = str(req.get("side") or "buy").lower()
+        qty = float(req.get("qty") or 1)
+
+        broker = "binance_testnet" if "/USDT" in symbol else "alpaca"
+
+        # Reuse existing execution endpoint logic by calling executor directly
+        if broker == "binance_testnet":
+            from execution.binance_testnet_executor import BinanceTestnetExecutor
+            executor = BinanceTestnetExecutor()
+            result = await executor.submit_order(
+                symbol=symbol.replace("/", ""),
+                qty=qty,
+                side=side,
+                order_type="market",
+                test_only=True,
+            )
+            return {"status": "submitted" if result.get("accepted") else "rejected", "strategy_id": strategy_id, "order": result}
+
+        from execution.alpaca_executor import AlpacaExecutor
+        executor = AlpacaExecutor()
+        await executor.setup()
+        result = await executor.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            order_type="market",
+            strategy_id=strategy_id,
+        )
+        return {"status": "submitted", "strategy_id": strategy_id, "strategy_name": strategy["name"], "order": result}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[api] paper_trade_strategy error: {}", exc)
+        raise HTTPException(500, str(exc))
+
 
 @app.post("/api/strategies/generate")
 async def generate_strategy(req: GenerateStrategyRequest):
@@ -592,6 +794,187 @@ async def manual_kill_switch(req: KillSwitchRequest):
         logger.error("[api] kill_switch error: {}", exc)
         raise HTTPException(500, str(exc))
 
+
+# ── Dashboard Live Data Endpoints ─────────────────────────────────────────────
+
+@app.get("/api/dashboard/market-bars")
+async def dashboard_market_bars(symbol: str = "AAPL", limit: int = 120):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT timestamp, open, high, low, close, volume
+            FROM market_data
+            WHERE symbol=$1
+            ORDER BY timestamp DESC
+            LIMIT $2
+            """,
+            symbol,
+            limit,
+        )
+        bars = [dict(r) for r in reversed(rows)]
+        return {"symbol": symbol, "count": len(bars), "bars": bars}
+    except Exception as exc:
+        logger.error("[api] dashboard_market_bars error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/api/dashboard/recent-signals")
+async def dashboard_recent_signals(limit: int = 8):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT source, source_url, description, entry_rules, exit_rules, confidence, scout, created_at
+            FROM strategy_hypotheses
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.error("[api] dashboard_recent_signals error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/api/dashboard/portfolio-live")
+async def dashboard_portfolio_live():
+    try:
+        from execution.alpaca_executor import AlpacaExecutor
+
+        executor = AlpacaExecutor()
+        await executor.setup()
+
+        account = await executor.get_account()
+        alpaca_positions = await executor.get_positions()
+
+        db_rows = await db.fetch(
+            "SELECT * FROM positions WHERE status='open' ORDER BY opened_at DESC"
+        )
+
+        positions = []
+        for p in alpaca_positions or []:
+            positions.append({
+                "symbol": p.get("symbol"),
+                "qty": float(p.get("qty") or 0),
+                "side": p.get("side") or "long",
+                "market_value": float(p.get("market_value") or 0),
+                "avg_entry_price": float(p.get("avg_entry_price") or 0),
+                "current_price": float(p.get("current_price") or 0),
+                "unrealized_pnl": float(p.get("unrealized_pl") or 0),
+                "unrealized_pnl_pct": float(p.get("unrealized_plpc") or 0),
+                "status": "open",
+            })
+
+        if not positions:
+            positions = [dict(r) for r in db_rows]
+
+        portfolio_value = float(account.get("portfolio_value") or account.get("equity") or 0)
+        buying_power = float(account.get("buying_power") or 0)
+        cash = float(account.get("cash") or 0)
+        daily_pnl = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
+
+        allocation = []
+        total_mv = sum(abs(float(p.get("market_value") or 0)) for p in positions)
+        for p in positions:
+            mv = abs(float(p.get("market_value") or 0))
+            allocation.append({
+                "symbol": p.get("symbol"),
+                "value": mv,
+                "pct": (mv / total_mv * 100) if total_mv else 0,
+            })
+
+        return {
+            "account": {
+                "portfolio_value": portfolio_value,
+                "buying_power": buying_power,
+                "cash": cash,
+                "status": account.get("status"),
+                "currency": account.get("currency", "USD"),
+                "trading_blocked": account.get("trading_blocked"),
+                "account_blocked": account.get("account_blocked"),
+            },
+            "positions": positions,
+            "open_count": len(positions),
+            "daily_pnl": daily_pnl,
+            "total_unrealized_pnl": daily_pnl,
+            "asset_distribution": allocation,
+        }
+    except Exception as exc:
+        logger.error("[api] dashboard_portfolio_live error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/api/dashboard/orders-live")
+async def dashboard_orders_live(limit: int = 20):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT *
+            FROM orders
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.warning("[api] orders-live fallback: {}", exc)
+        return []
+
+
+@app.get("/api/dashboard/alerts-live")
+async def dashboard_alerts_live(limit: int = 10):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT source, source_url, description, confidence, scout, created_at
+            FROM strategy_hypotheses
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        alerts = []
+        for r in rows:
+            alerts.append({
+                "type": "signal",
+                "severity": "info",
+                "title": f"{str(r['source']).upper()} hypothesis",
+                "message": r["description"],
+                "confidence": float(r["confidence"] or 0),
+                "source_url": r["source_url"],
+                "created_at": r["created_at"],
+            })
+        return alerts
+    except Exception as exc:
+        logger.error("[api] dashboard_alerts_live error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/api/dashboard/market-status")
+async def dashboard_market_status():
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+        minutes = now_et.hour * 60 + now_et.minute
+        is_weekday = now_et.weekday() < 5
+        is_open = is_weekday and 570 <= minutes <= 960
+
+        return {
+            "market": "US_EQUITIES",
+            "is_open": is_open,
+            "label": "MARKET OPEN" if is_open else "MARKET CLOSED",
+            "utc": now_utc.isoformat(),
+            "et": now_et.isoformat(),
+        }
+    except Exception as exc:
+        logger.error("[api] dashboard_market_status error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
 # ── Agents ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/agents/registry")
@@ -839,6 +1222,65 @@ async def test_order(req: OrderRequest):
         raise
     except Exception as exc:
         logger.error("[api] test_order error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+
+@app.get("/api/dashboard/scout-status")
+async def dashboard_scout_status():
+    try:
+        rows = await db.fetch(
+            """
+            SELECT
+              source,
+              scout,
+              COUNT(*) AS total,
+              MAX(created_at) AS latest
+            FROM strategy_hypotheses
+            GROUP BY source, scout
+            ORDER BY latest DESC
+            """
+        )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.error("[api] dashboard_scout_status error: {}", exc)
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/api/scouts/youtube/auto-run")
+async def youtube_auto_run_once():
+    try:
+        from scouts.youtube_scout import YouTubeScout
+
+        scout = YouTubeScout()
+        await scout.setup()
+
+        queries = [
+            "algorithmic trading strategy",
+            "VWAP trading strategy",
+            "momentum trading strategy",
+            "mean reversion trading strategy",
+            "crypto trading strategy",
+        ]
+
+        all_hypotheses = []
+        for q in queries:
+            try:
+                hs = await scout.search_and_extract(query=q, max_results=2)
+                all_hypotheses.extend(hs)
+            except Exception as exc:
+                logger.warning("[youtube_auto] query failed {}: {}", q, exc)
+
+        return {
+            "status": "completed",
+            "source": "youtube",
+            "queries": queries,
+            "saved_count": len(all_hypotheses),
+            "note": "If saved_count is 0, likely all discovered videos were duplicates or unavailable.",
+            "hypotheses": all_hypotheses,
+        }
+    except Exception as exc:
+        logger.error("[api] youtube_auto_run_once error: {}", exc)
         raise HTTPException(500, str(exc))
 
 
