@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
     await ks.setup()
     logger.info("[api] ATLAS API ready on :8080")
     asyncio.create_task(_youtube_scout_auto_loop())
+    asyncio.create_task(_auto_strategy_backtest_loop())
     yield
     await db.close_pool()
 
@@ -228,11 +229,11 @@ async def _youtube_scout_auto_loop():
             scout = YouTubeScout()
             await scout.setup()
             queries = [
-                "algorithmic trading strategy",
-                "VWAP trading strategy",
-                "momentum trading strategy",
-                "mean reversion trading strategy",
-                "crypto trading strategy",
+                "systematic trading strategy with entry exit rules",
+                "algorithmic trading strategy backtest technical indicators",
+                "quantitative trading strategy mean reversion momentum breakout",
+                "VWAP RSI MACD trading strategy",
+                "crypto futures trading strategy risk management",
             ]
             saved = 0
             for q in queries:
@@ -241,6 +242,78 @@ async def _youtube_scout_auto_loop():
             logger.info("[youtube_auto] completed scheduled scout run; saved={}", saved)
         except Exception as exc:
             logger.warning("[youtube_auto] scheduled scout run failed: {}", exc)
+
+        await asyncio.sleep(6 * 60 * 60)
+
+
+
+async def _auto_strategy_backtest_loop():
+    await asyncio.sleep(120)
+
+    while True:
+        try:
+            from strategy_engine.ideator import run_ideator_dynamic
+            from strategy_engine.strategy_coder import run_strategy_coder
+            from backtesting.backtest_engine import BacktestEngine
+
+            jobs = [
+                {"asset_class": "us_equities", "symbols": ["AAPL"], "timeframe": "1h", "style": "momentum"},
+                {"asset_class": "us_equities", "symbols": ["NVDA"], "timeframe": "1h", "style": "breakout"},
+                {"asset_class": "crypto", "symbols": ["BTC/USDT"], "timeframe": "1h", "style": "momentum"},
+            ]
+
+            generated_total = 0
+            backtested_total = 0
+
+            for job in jobs:
+                try:
+                    strategy_ids = await run_ideator_dynamic(
+                        asset_class=job["asset_class"],
+                        symbols=job["symbols"],
+                        timeframe=job["timeframe"],
+                        style=job["style"],
+                        lookback_days=90,
+                        custom_prompt=(
+                            "Generate only practical systematic trading strategies. "
+                            "The strategy must be testable from OHLCV and technical indicators. "
+                            "Use ONLY the exact requested symbol(s): " + ", ".join(job["symbols"]) + ". "
+                            "Do not use SPY, QQQ, ETF proxies, benchmark symbols, or unrelated tickers unless they are explicitly requested. "
+                            "Do not generate non-trading, educational, space, engineering, or unrelated content."
+                        ),
+                    )
+
+                    if not strategy_ids:
+                        continue
+
+                    generated_total += len(strategy_ids)
+
+                    coded_ids = await run_strategy_coder(strategy_id=strategy_ids[0])
+
+                    for sid in coded_ids or strategy_ids:
+                        try:
+                            symbol = job["symbols"][0]
+                            engine = BacktestEngine()
+                            await engine.run(
+                                symbol=symbol,
+                                strategy_id=sid,
+                                start=datetime.now(timezone.utc) - timedelta(days=90),
+                                end=datetime.now(timezone.utc),
+                            )
+                            backtested_total += 1
+                        except Exception as exc:
+                            logger.warning("[auto_strategy] backtest failed for {}: {}", sid, exc)
+
+                except Exception as exc:
+                    logger.warning("[auto_strategy] job failed {}: {}", job, exc)
+
+            logger.info(
+                "[auto_strategy] scheduled cycle complete; generated={} backtested={}",
+                generated_total,
+                backtested_total,
+            )
+
+        except Exception as exc:
+            logger.warning("[auto_strategy] scheduled cycle failed: {}", exc)
 
         await asyncio.sleep(6 * 60 * 60)
 

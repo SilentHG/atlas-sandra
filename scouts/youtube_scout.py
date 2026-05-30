@@ -97,6 +97,21 @@ def _clean_transcript_text(text: str, max_chars: int = 12000) -> str:
     return text[:max_chars]
 
 
+
+def _is_trading_related(text: str) -> bool:
+    t = (text or "").lower()
+    required_any = [
+        "trading", "trade", "strategy", "backtest", "market", "price action",
+        "vwap", "rsi", "macd", "breakout", "momentum", "mean reversion",
+        "forex", "crypto", "stock", "equity", "futures", "options"
+    ]
+    blocked_any = [
+        "space shuttle", "rocket", "nasa", "engineering", "minecraft",
+        "gaming", "movie", "music video", "cooking", "football", "workout"
+    ]
+    return any(k in t for k in required_any) and not any(k in t for k in blocked_any)
+
+
 class YouTubeScout:
     """Searches YouTube and extracts strategy hypotheses via Claude."""
 
@@ -296,6 +311,11 @@ class YouTubeScout:
 
     async def _extract(self, video: dict) -> dict | None:
         try:
+            precheck_text = f"{video.get('title','')} {video.get('description','')} {video.get('url','')}"
+            if not _is_trading_related(precheck_text):
+                logger.info("[youtube_scout] Non-trading video skipped: {}", video.get("title"))
+                return None
+
             if await self._already_seen(video.get("url")):
                 logger.info("[youtube_scout] Duplicate skipped: {}", video.get("url"))
                 return None
@@ -336,6 +356,16 @@ class YouTubeScout:
                 lines = raw.splitlines()
                 raw = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
             data = json.loads(raw)
+
+            postcheck_text = " ".join([
+                str(data.get("description","")),
+                " ".join(map(str, data.get("entry_rules", []))),
+                " ".join(map(str, data.get("exit_rules", []))),
+            ])
+            if not _is_trading_related(postcheck_text):
+                logger.info("[youtube_scout] Extracted hypothesis rejected as non-trading: {}", video.get("title"))
+                return None
+
             video["transcript_summary"] = summary
             video["transcript_chars_used"] = len(transcript or "")
             video["transcript_unavailable"] = transcript_unavailable
