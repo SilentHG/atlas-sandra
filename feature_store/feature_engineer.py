@@ -46,7 +46,7 @@ from database import connection as db
 # ── Universe ───────────────────────────────────────────────────────────────────
 
 EQUITY_SYMBOLS: list[str] = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"]
-CRYPTO_SYMBOLS: list[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+CRYPTO_SYMBOLS: list[str] = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 ALL_SYMBOLS:    list[str] = EQUITY_SYMBOLS + CRYPTO_SYMBOLS
 LOOKBACK_BARS               = 220
 FEATURE_VERSION             = 2   # bumped: added Stochastic, W%R, CCI, ranging_score
@@ -501,6 +501,97 @@ def _compute_features(df: pd.DataFrame, symbol: str) -> dict[str, tuple[float, d
         _safe(volume.iloc[-1] * cur_close, "dollar_volume", {"type": "DOLLAR_VOLUME"})
         if cur_range and cur_range != 0:
             _safe(volume.iloc[-1] / cur_range, "volume_per_range", {"type": "VOLUME_PER_RANGE"})
+
+
+    # 23. Institutional supplemental feature pack for 200+ feature acceptance target
+    # These are deterministic OHLCV-derived features; no external data dependency.
+    returns = close.pct_change()
+    log_returns = np.log(close / close.shift(1)).replace([np.inf, -np.inf], np.nan)
+
+    # Return distribution features
+    for p in (5, 10, 20, 30, 50):
+        if n >= p:
+            r = returns.tail(p).dropna()
+            lr = log_returns.tail(p).dropna()
+            if len(r) >= 3:
+                _safe(r.mean(), f"ret_mean_{p}", {"window": p, "type": "RETURN_MEAN"})
+                _safe(r.std(ddof=1), f"ret_std_{p}", {"window": p, "type": "RETURN_STD"})
+                _safe(r.skew(), f"ret_skew_{p}", {"window": p, "type": "RETURN_SKEW"})
+                _safe(r.kurt(), f"ret_kurt_{p}", {"window": p, "type": "RETURN_KURT"})
+                _safe((r > 0).mean(), f"positive_return_ratio_{p}", {"window": p, "type": "POS_RETURN_RATIO"})
+                _safe((r < 0).mean(), f"negative_return_ratio_{p}", {"window": p, "type": "NEG_RETURN_RATIO"})
+            if len(lr) >= 3:
+                downside = lr[lr < 0]
+                upside = lr[lr > 0]
+                _safe(downside.std(ddof=1) if len(downside) > 1 else 0, f"downside_vol_{p}", {"window": p, "type": "DOWNSIDE_VOL"})
+                _safe(upside.std(ddof=1) if len(upside) > 1 else 0, f"upside_vol_{p}", {"window": p, "type": "UPSIDE_VOL"})
+
+    # Rolling quantiles and percentile position
+    for p in (20, 50, 100):
+        if n >= p:
+            cwin = close.tail(p)
+            vwin = volume.tail(p)
+            q10 = cwin.quantile(0.10)
+            q25 = cwin.quantile(0.25)
+            q75 = cwin.quantile(0.75)
+            q90 = cwin.quantile(0.90)
+            _safe(q10, f"close_q10_{p}", {"window": p, "type": "PRICE_QUANTILE"})
+            _safe(q25, f"close_q25_{p}", {"window": p, "type": "PRICE_QUANTILE"})
+            _safe(q75, f"close_q75_{p}", {"window": p, "type": "PRICE_QUANTILE"})
+            _safe(q90, f"close_q90_{p}", {"window": p, "type": "PRICE_QUANTILE"})
+            if q90 != q10:
+                _safe((cur_close - q10) / (q90 - q10), f"price_percentile_proxy_{p}", {"window": p, "type": "PRICE_PERCENTILE_PROXY"})
+            vq90 = vwin.quantile(0.90)
+            vq10 = vwin.quantile(0.10)
+            _safe(vq90, f"volume_q90_{p}", {"window": p, "type": "VOLUME_QUANTILE"})
+            if vq90 != vq10:
+                _safe((volume.iloc[-1] - vq10) / (vq90 - vq10), f"volume_percentile_proxy_{p}", {"window": p, "type": "VOLUME_PERCENTILE_PROXY"})
+
+    # Liquidity / efficiency / pressure proxies
+    for p in (10, 20, 50):
+        if n >= p:
+            c0 = close.iloc[-p]
+            path = close.diff().abs().tail(p).sum()
+            net = abs(cur_close - c0)
+            if path and path != 0:
+                _safe(net / path, f"efficiency_ratio_{p}", {"window": p, "type": "EFFICIENCY_RATIO"})
+            spread_proxy = ((high - low) / close.replace(0, np.nan)).tail(p)
+            _safe(spread_proxy.mean(), f"avg_spread_proxy_{p}", {"window": p, "type": "SPREAD_PROXY"})
+            _safe((returns.tail(p).abs() * volume.tail(p)).sum(), f"vol_weighted_abs_return_{p}", {"window": p, "type": "VOL_WEIGHTED_ABS_RETURN"})
+            buy_pressure = ((close - low) / (high - low).replace(0, np.nan)).tail(p).mean()
+            sell_pressure = ((high - close) / (high - low).replace(0, np.nan)).tail(p).mean()
+            _safe(buy_pressure, f"buy_pressure_{p}", {"window": p, "type": "BUY_PRESSURE"})
+            _safe(sell_pressure, f"sell_pressure_{p}", {"window": p, "type": "SELL_PRESSURE"})
+            _safe(buy_pressure - sell_pressure, f"net_pressure_{p}", {"window": p, "type": "NET_PRESSURE"})
+
+    # Trend consistency / breakout context
+    for p in (10, 20, 50, 100):
+        if n >= p:
+            r = returns.tail(p).dropna()
+            if len(r) > 2:
+                signs = np.sign(r)
+                _safe((signs > 0).sum() / len(signs), f"trend_up_ratio_{p}", {"window": p, "type": "TREND_UP_RATIO"})
+                _safe((signs < 0).sum() / len(signs), f"trend_down_ratio_{p}", {"window": p, "type": "TREND_DOWN_RATIO"})
+            rh = high.rolling(p).max().iloc[-2] if n > p else np.nan
+            rl = low.rolling(p).min().iloc[-2] if n > p else np.nan
+            if np.isfinite(rh) and rh != 0:
+                _safe(1.0 if cur_close > rh else 0.0, f"breakout_high_flag_{p}", {"window": p, "type": "BREAKOUT_HIGH_FLAG"})
+            if np.isfinite(rl) and rl != 0:
+                _safe(1.0 if cur_close < rl else 0.0, f"breakdown_low_flag_{p}", {"window": p, "type": "BREAKDOWN_LOW_FLAG"})
+
+    # Volatility regime percentiles
+    for p in (20, 50, 100):
+        if n >= p + 20:
+            tr_series = (high - low) / close.replace(0, np.nan)
+            latest_tr = tr_series.iloc[-1]
+            hist = tr_series.tail(p).dropna()
+            if len(hist) > 5:
+                _safe((hist < latest_tr).mean(), f"range_percentile_{p}", {"window": p, "type": "RANGE_PERCENTILE"})
+            rv = log_returns.rolling(20).std().tail(p).dropna()
+            if len(rv) > 5:
+                latest_rv = rv.iloc[-1]
+                _safe((rv < latest_rv).mean(), f"realized_vol_percentile_{p}", {"window": p, "type": "RV_PERCENTILE"})
+
 
 
     return features
