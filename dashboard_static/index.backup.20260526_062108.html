@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ATLAS Trading Terminal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,Arial,sans-serif;background:#05070d;color:#e5e7eb}
+.app{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+.sidebar{background:#080b13;border-right:1px solid #1f2937;padding:22px}
+.logo{font-size:22px;font-weight:900;margin-bottom:28px;color:#fff}
+.logo span{color:#22c55e}
+.nav div{padding:12px 14px;border-radius:12px;color:#9ca3af;margin-bottom:6px}
+.nav div.active,.nav div:hover{background:#111827;color:#fff}
+.main{padding:24px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}
+h1{margin:0;font-size:28px}
+.sub{color:#9ca3af;margin-top:6px}
+.live{background:#052e16;color:#4ade80;border:1px solid #166534;padding:10px 15px;border-radius:999px;font-weight:800}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:18px}
+.card{background:linear-gradient(180deg,#101827,#070b13);border:1px solid #1f2937;border-radius:18px;padding:18px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+.label{font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em}
+.value{font-size:32px;font-weight:900;margin-top:8px}
+.green{color:#22c55e}.blue{color:#3b82f6}.gold{color:#f59e0b}.red{color:#ef4444}
+.layout{display:grid;grid-template-columns:2fr 1fr;gap:18px}
+h2{margin:0 0 14px;font-size:18px}
+.chartBox{height:360px}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:12px;border-bottom:1px solid #1f2937;text-align:left;font-size:13px}
+.table th{color:#94a3b8;text-transform:uppercase;font-size:11px}
+.pill{padding:5px 9px;border-radius:999px;background:#0f2d1e;color:#4ade80;font-size:12px;font-weight:700}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}
+.item{background:#0b1220;border:1px solid #1f2937;border-radius:14px;padding:13px;margin-bottom:10px}
+.item strong{display:block;margin-bottom:5px}
+.muted{color:#94a3b8;font-size:13px;line-height:1.45}
+.footer{margin-top:18px;color:#64748b;font-size:13px}
+@media(max-width:1100px){.app{grid-template-columns:1fr}.sidebar{display:none}.metrics,.layout,.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo">ATLAS<span>AI</span></div>
+    <div class="nav">
+      <div class="active" onclick="switchView('command')">Command Center</div>
+      <div onclick="switchView('strategies')">Strategies</div>
+      <div onclick="switchView('market')">Market Data</div>
+      <div onclick="switchView('patterns')">Pattern Engine</div>
+      <div onclick="switchView('scouts')">Scout Network</div>
+      <div onclick="switchView('copy')">Copy Trading</div>
+      <div onclick="switchView('risk')">Risk Controls</div>
+      <div onclick="switchView('logs')">System Logs</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1>Trading Intelligence Terminal</h1>
+        <div class="sub">Live strategy generation, market data, pattern detection, and autonomous improvement.</div>
+      </div>
+      <div class="live" id="badge">LIVE DATA</div>
+    </div>
+
+    <div id="pageTitleBlock">
+    <section class="metrics">
+      <div class="card"><div class="label">System Health</div><div class="value green" id="health">--</div></div>
+      <div class="card"><div class="label">Strategies</div><div class="value blue" id="strategies">--</div></div>
+      <div class="card"><div class="label">Feature Store</div><div class="value gold" id="features">145+</div></div>
+      <div class="card"><div class="label">Market Feed</div><div class="value green" id="market">--</div></div>
+    </section>
+
+    <section class="layout">
+      <div class="card">
+        <h2>Live Market Curve</h2>
+        <div class="chartBox"><canvas id="marketChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <h2>Automation Status</h2>
+        <div id="automation"></div>
+      </div>
+    </section>
+
+    <section class="grid2">
+      <div class="card">
+        <h2>Latest Strategies</h2>
+        <table class="table">
+          <thead><tr><th>Strategy</th><th>Type</th><th>Status</th></tr></thead>
+          <tbody id="strategyRows"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Pattern Recognition</h2>
+        <div id="patterns"></div>
+      </div>
+
+      <div class="card">
+        <h2>Scout Network</h2>
+        <div id="scouts"></div>
+      </div>
+
+      <div class="card">
+        <h2>Self-Improvement Engine</h2>
+        <div id="improvement"></div>
+      </div>
+    </section>
+
+    </div>
+
+    <section id="dynamicView" style="display:none"></section>
+
+    <div class="footer" id="updated">Last updated: --</div>
+  </main>
+</div>
+
+<script>
+let chart;
+async function getJson(url, options={}){const r=await fetch(url,options);return r.json()}
+function post(url, body){return getJson(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
+function item(title, text, cls=''){return `<div class="item"><strong class="${cls}">${title}</strong><div class="muted">${text}</div></div>`}
+
+async function renderChart(){
+  const ctx=document.getElementById('marketChart');
+  const market=await getJson('/api/market-data/AAPL?limit=100');
+  const rows=market.data || [];
+  const labels=rows.map(r => new Date(r.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  const data=rows.map(r => r.close);
+
+  if(chart) chart.destroy();
+  chart=new Chart(ctx,{
+    type:'line',
+    data:{
+      labels,
+      datasets:[{
+        label:'AAPL Live Close Price',
+        data,
+        borderColor:'#22c55e',
+        backgroundColor:'rgba(34,197,94,.12)',
+        fill:true,
+        tension:.35,
+        pointRadius:0
+      }]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      plugins:{legend:{labels:{color:'#cbd5e1'}}},
+      scales:{
+        x:{ticks:{color:'#64748b', maxTicksLimit:8},grid:{color:'#111827'}},
+        y:{ticks:{color:'#64748b'},grid:{color:'#111827'}}
+      }
+    }
+  });
+}
+
+
+function setActiveNav(label){
+  document.querySelectorAll('.nav div').forEach(el=>{
+    el.classList.toggle('active', el.textContent.trim() === label);
+  });
+}
+
+function showMain(){
+  document.getElementById('pageTitleBlock').style.display='block';
+  document.getElementById('dynamicView').style.display='none';
+}
+
+async function switchView(view){
+  const box=document.getElementById('dynamicView');
+  const main=document.getElementById('pageTitleBlock');
+  main.style.display='none';
+  box.style.display='block';
+
+  if(view==='command'){
+    setActiveNav('Command Center');
+    showMain();
+    return;
+  }
+
+  if(view==='strategies'){
+    setActiveNav('Strategies');
+    const strategies=await getJson('/api/strategies');
+    box.innerHTML=`<div class="card full"><h2>Strategies</h2>
+      <table class="table"><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Created</th></tr></thead>
+      <tbody>${strategies.map(s=>`<tr><td>${s.name}</td><td>${s.strategy_type}</td><td><span class="pill">${s.status}</span></td><td>${s.created_at||''}</td></tr>`).join('')}</tbody>
+      </table></div>`;
+  }
+
+  if(view==='market'){
+    setActiveNav('Market Data');
+    const data=await getJson('/api/market-data/AAPL?limit=50');
+    box.innerHTML=`<div class="card full"><h2>Market Data: AAPL</h2>
+      <table class="table"><thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
+      <tbody>${data.data.map(r=>`<tr><td>${new Date(r.timestamp).toLocaleString()}</td><td>${r.open}</td><td>${r.high}</td><td>${r.low}</td><td>${r.close}</td><td>${Math.round(r.volume)}</td></tr>`).join('')}</tbody>
+      </table></div>`;
+  }
+
+  if(view==='patterns'){
+    setActiveNav('Pattern Engine');
+    const p=await post('/api/patterns/detect',{symbol:'AAPL',lookback_bars:120});
+    box.innerHTML=`<div class="card full"><h2>Pattern Engine</h2>
+      ${(p.patterns||[]).map(x=>item(x.pattern, `${x.description||''} Confidence: ${x.confidence||'n/a'}`, 'green')).join('') || item('No Pattern','No active pattern detected')}</div>`;
+  }
+
+  if(view==='scouts'){
+    setActiveNav('Scout Network');
+    const d=await post('/api/scouts/test',{source:'discord',limit:3});
+    const r=await post('/api/scouts/test',{source:'reddit',subreddits:['algotrading'],limit:3});
+    const y=await post('/api/scouts/test',{source:'youtube',query:'momentum trading strategy',max_results:3});
+    box.innerHTML=`<div class="card full"><h2>Scout Network</h2>
+      ${item('Discord Scout', `${d.count} hypotheses`, 'green')}
+      ${item('Reddit Scout', `${r.count} hypotheses`, 'green')}
+      ${item('YouTube Scout', `${y.count} hypotheses`, 'green')}
+      </div>`;
+  }
+
+  if(view==='copy'){
+    setActiveNav('Copy Trading');
+    const c=await post('/api/copy-trading/mirror-test',{
+      leader_account:'leader_latency_test',
+      leader_order_id:'dashboard-copy-test',
+      symbol:'AAPL',
+      side:'buy',
+      leader_qty:10,
+      leader_equity:100000,
+      follower_equity:25000,
+      price:100,
+      fill_ratio:0.5
+    });
+    box.innerHTML=`<div class="card full"><h2>Copy Trading</h2>
+      ${item('Followers Found', c.followers_found, 'blue')}
+      ${(c.events||[]).map(e=>item(e.status, `Follower Qty: ${e.follower_qty} | Latency: ${e.latency_ms}ms | Fill Ratio: ${e.fill_ratio}`, 'green')).join('')}
+      </div>`;
+  }
+
+  if(view==='risk'){
+    setActiveNav('Risk Controls');
+    const health=await getJson('/health');
+    box.innerHTML=`<div class="card full"><h2>Risk Controls</h2>
+      ${item('Kill Switch', health.services?.kill_switch || 'unknown', 'gold')}
+      ${item('System Health', health.status || 'unknown', 'green')}
+      ${item('Market Feed', health.services?.last_data_timestamp?.status || 'unknown', 'green')}
+      </div>`;
+  }
+
+  if(view==='logs'){
+    setActiveNav('System Logs');
+    const health=await getJson('/health');
+    box.innerHTML=`<div class="card full"><h2>System Logs</h2>
+      ${item('API', 'FastAPI service online', 'green')}
+      ${item('Database', health.services?.timescaledb || 'unknown', 'green')}
+      ${item('Feature Store', health.services?.feature_store?.status || 'unknown', 'green')}
+      ${item('Last Data Timestamp', health.services?.last_data_timestamp?.timestamp || 'unknown', 'blue')}
+      </div>`;
+  }
+}
+
+async function load(){
+  const health=await getJson('/health');
+  const strategies=await getJson('/api/strategies');
+
+  document.getElementById('health').textContent=health.status||'unknown';
+  document.getElementById('strategies').textContent=strategies.length;
+  document.getElementById('market').textContent=health.services?.last_data_timestamp?.status||'unknown';
+
+  document.getElementById('automation').innerHTML=
+    item('TimescaleDB', health.services?.timescaledb || 'unknown','green')+
+    item('Feature Store', health.services?.feature_store?.status || 'unknown','green')+
+    item('Kill Switch', health.services?.kill_switch || 'unknown','gold')+
+    item('Active Strategies', health.services?.strategies?.active || 0,'blue');
+
+  document.getElementById('strategyRows').innerHTML=strategies.slice(0,7).map(s=>`
+    <tr><td>${s.name}</td><td>${s.strategy_type}</td><td><span class="pill">${s.status}</span></td></tr>
+  `).join('');
+
+  const pattern=await post('/api/patterns/detect',{symbol:'AAPL',lookback_bars:120});
+  document.getElementById('patterns').innerHTML=(pattern.patterns||[]).map(p=>
+    item(p.pattern, `${p.description||'Pattern detected'} — confidence ${p.confidence||'n/a'}`,'green')
+  ).join('') || item('No pattern', 'No current pattern detected.');
+
+  const scout=await post('/api/scouts/test',{source:'discord',limit:3});
+  document.getElementById('scouts').innerHTML=
+    item('Discord Scout', `${scout.count||0} hypotheses detected`,'green')+
+    item('Reddit Scout', 'Live-ready with API fallback mode','blue')+
+    item('YouTube Scout', 'Live-ready with API fallback mode','gold');
+
+  const improve=await post('/api/self-improvement/run-cycle',{limit:10});
+  document.getElementById('improvement').innerHTML=(improve.actions||[]).slice(0,4).map(a=>
+    item(a.decision, `Strategy ${a.strategy_id.slice(0,8)}... | mutations: ${(a.mutated_strategy_ids||[]).length}`,'blue')
+  ).join('') || item('Stable', 'No improvement actions pending.','green');
+
+  document.getElementById('updated').textContent='Last updated: '+new Date().toLocaleString();
+  await renderChart();
+}
+load();
+setInterval(load,15000);
+</script>
+</body>
+</html>

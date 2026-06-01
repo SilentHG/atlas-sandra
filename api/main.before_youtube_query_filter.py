@@ -167,14 +167,6 @@ class SensitivityRequest(BaseModel):
 class RegimeValidationRequest(BaseModel):
     regime_metrics: dict
 
-
-class FactoryEvaluateRequest(BaseModel):
-    limit: int = 50
-    code_drafts: bool = True
-    promote_top: int = 5
-    symbols: list[str] = ["AAPL", "NVDA", "BTC/USDT"]
-    min_trades: int = 20
-
 class SelfImprovementCycleRequest(BaseModel):
     limit: int = 10
 
@@ -237,11 +229,11 @@ async def _youtube_scout_auto_loop():
             scout = YouTubeScout()
             await scout.setup()
             queries = [
-                "systematic trading strategy with entry exit rules",
-                "algorithmic trading strategy backtest technical indicators",
-                "quantitative trading strategy mean reversion momentum breakout",
-                "VWAP RSI MACD trading strategy",
-                "crypto futures trading strategy risk management",
+                "algorithmic trading strategy",
+                "VWAP trading strategy",
+                "momentum trading strategy",
+                "mean reversion trading strategy",
+                "crypto trading strategy",
             ]
             saved = 0
             for q in queries:
@@ -1887,164 +1879,6 @@ async def mutate_strategy(strategy_id: str, req: StrategyMutationRequest):
 
 
 # ── Day 5: Self-Improvement Cycle ─────────────────────────────────────────────
-
-
-@app.post("/api/strategies/factory-evaluate")
-async def factory_evaluate(req: FactoryEvaluateRequest):
-    """
-    Scale strategy evaluation:
-    1. Code pending draft strategies
-    2. Backtest a batch of active/live_ready strategies
-    3. Score them
-    4. Mark losers failed, keep viable active, promote top candidates to live_ready
-    """
-    try:
-        from strategy_engine.strategy_coder import run_strategy_coder
-        from backtesting.backtest_engine import BacktestEngine
-
-        coded_ids = []
-        if req.code_drafts:
-            try:
-                coded_ids = await run_strategy_coder(strategy_id=None)
-            except Exception as exc:
-                logger.warning("[factory] coding drafts failed: {}", exc)
-
-        rows = await db.fetch(
-            """
-            SELECT id,name,status,symbols
-            FROM strategies
-            WHERE status IN ('active','live_ready')
-            ORDER BY created_at DESC
-            LIMIT $1
-            """,
-            max(1, int(req.limit)),
-        )
-
-        evaluated = []
-        engine = BacktestEngine()
-
-        for row in rows:
-            sid = str(row["id"])
-            name = row["name"]
-            symbols = list(row["symbols"] or [])
-            symbol = symbols[0] if symbols else (req.symbols[0] if req.symbols else "AAPL")
-
-            # Avoid unsupported/missing symbol formats.
-            if symbol not in req.symbols and req.symbols:
-                symbol = req.symbols[0]
-
-            try:
-                results = await engine.run(
-                    symbol=symbol,
-                    strategy_id=sid,
-                    start=datetime.now(timezone.utc) - timedelta(days=7),
-                    end=datetime.now(timezone.utc),
-                )
-
-                bt = results.get("backtest")
-                mc = results.get("monte_carlo") or bt
-
-                if not bt:
-                    continue
-
-                sharpe = float(bt.sharpe_ratio or 0)
-                mc_sharpe = float(mc.sharpe_ratio or 0)
-                pf = float(bt.profit_factor or 0)
-                wr = float(bt.win_rate or 0)
-                dd = float(bt.max_drawdown or 0)
-                trades = int(bt.total_trades or 0)
-                total_return = float(bt.total_return or 0)
-
-                score = (
-                    sharpe * 35
-                    + mc_sharpe * 20
-                    + max(0, pf - 1) * 20
-                    + wr * 15
-                    + max(-1, dd) * 10
-                    + min(trades / 100, 1) * 10
-                    + total_return * 10
-                )
-
-                if trades < req.min_trades:
-                    verdict = "failed"
-                elif sharpe > 1 and mc_sharpe > 0.5 and pf > 1.2 and dd > -0.35:
-                    verdict = "pass"
-                elif sharpe > 0 and pf > 1.0 and dd > -0.5:
-                    verdict = "promising"
-                else:
-                    verdict = "failed"
-
-                evaluated.append({
-                    "strategy_id": sid,
-                    "name": name,
-                    "symbol": symbol,
-                    "score": round(float(score), 4),
-                    "verdict": verdict,
-                    "sharpe": sharpe,
-                    "monte_carlo_sharpe": mc_sharpe,
-                    "profit_factor": pf,
-                    "win_rate": wr,
-                    "max_drawdown": dd,
-                    "total_return": total_return,
-                    "total_trades": trades,
-                })
-
-            except Exception as exc:
-                logger.warning("[factory] evaluation failed for {} {}: {}", sid, name, exc)
-                evaluated.append({
-                    "strategy_id": sid,
-                    "name": name,
-                    "symbol": symbol,
-                    "score": -999,
-                    "verdict": "failed",
-                    "error": str(exc),
-                })
-
-        evaluated.sort(key=lambda x: x.get("score", -999), reverse=True)
-
-        promoted = []
-        failed = []
-
-        # First mark all evaluated failed/promising/active based on verdict.
-        for item in evaluated:
-            sid = item["strategy_id"]
-            verdict = item.get("verdict")
-
-            if verdict == "failed":
-                await db.execute(
-                    "UPDATE strategies SET status='failed', updated_at=NOW() WHERE id=$1",
-                    sid,
-                )
-                failed.append(sid)
-            elif verdict in ("pass", "promising"):
-                await db.execute(
-                    "UPDATE strategies SET status='active', updated_at=NOW() WHERE id=$1",
-                    sid,
-                )
-
-        # Promote top pass/promising candidates.
-        candidates = [x for x in evaluated if x.get("verdict") in ("pass", "promising")]
-        for item in candidates[: max(0, int(req.promote_top))]:
-            await db.execute(
-                "UPDATE strategies SET status='live_ready', updated_at=NOW() WHERE id=$1",
-                item["strategy_id"],
-            )
-            promoted.append(item["strategy_id"])
-            item["verdict"] = "live_ready"
-
-        return {
-            "status": "completed",
-            "coded_drafts": len(coded_ids),
-            "evaluated": len(evaluated),
-            "promoted": len(promoted),
-            "failed": len(failed),
-            "top": evaluated[:20],
-        }
-
-    except Exception as exc:
-        logger.error("[api] factory_evaluate error: {}", exc)
-        raise HTTPException(500, str(exc))
-
 
 @app.post("/api/self-improvement/run-cycle")
 async def run_self_improvement_cycle(req: SelfImprovementCycleRequest):

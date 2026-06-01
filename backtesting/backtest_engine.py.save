@@ -8,7 +8,7 @@ and saves to backtests table.
 """
 from __future__ import annotations
 
-import json, uuid, inspect
+import json, uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -43,7 +43,6 @@ class BacktestResult:
     sortino_ratio:      float = 0.0
     max_drawdown:       float = 0.0
     win_rate:           float = 0.0
-    profit_factor:      float = 0.0
     avg_win:            float = 0.0
     avg_loss:           float = 0.0
     avg_trade_duration: float = 0.0   # minutes
@@ -52,28 +51,15 @@ class BacktestResult:
     equity_curve:       list  = field(default_factory=list)
     parameters:         dict  = field(default_factory=dict)
     run_id:             str   = field(default_factory=lambda: str(uuid.uuid4()))
-
-    @property
     def annualized_return(self) -> float:
         days = max((self.end_date - self.start_date).days, 1)
-
-        if self.initial_capital <= 0:
-            return 0.0
-
-        r = self.net_pnl / self.initial_capital
-
-        # portfolio lost 100% or more
-        if (1 + r) <= 0:
-            return -1.0
-
-        try:
-            return float((1 + r) ** (365 / days) - 1)
-        except Exception:
-            return 0.0
+        r    = self.net_pnl / self.initial_capital
+        return (1 + r) ** (365 / days) - 1
 
     @property
     def total_return(self) -> float:
         return self.net_pnl / self.initial_capital
+
 
 class BacktestEngine:
     """Walk-forward backtester with strict split discipline."""
@@ -134,205 +120,6 @@ class BacktestEngine:
         df.loc[df["ema_fast"] < df["ema_slow"], "signal"]  = -1
         df["pos_change"] = df["signal"].diff().fillna(0)
         return df
-
-    @staticmethod
-    def _enrich_generated_strategy_features(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add ATLAS-style indicator columns expected by generated strategies:
-        ema_9, ema_21, ema_50, rsi_14, atr_14, adx_14, volume_ma_20, vwap, etc.
-        """
-        df = df.copy()
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-        volume = df["volume"]
-
-        for p in (5, 9, 10, 20, 21, 50, 100, 200):
-            if len(df) >= p:
-                df[f"ema_{p}"] = close.ewm(span=p, adjust=False).mean()
-                df[f"sma_{p}"] = close.rolling(p).mean()
-
-        for p in (10, 20, 50):
-            if len(df) >= p:
-                df[f"volume_ma_{p}"] = volume.rolling(p).mean()
-                df[f"volume_sma_{p}"] = volume.rolling(p).mean()
-
-        def _rsi(series, p=14):
-            d = series.diff()
-            gain = d.clip(lower=0).ewm(alpha=1 / p, adjust=False).mean()
-            loss = (-d.clip(upper=0)).ewm(alpha=1 / p, adjust=False).mean()
-            rs = gain / loss.replace(0, np.nan)
-            return 100 - 100 / (1 + rs)
-
-        for p in (7, 14):
-            df[f"rsi_{p}"] = _rsi(close, p)
-
-        pc = close.shift(1)
-        tr = pd.concat([
-            high - low,
-            (high - pc).abs(),
-            (low - pc).abs()
-        ], axis=1).max(axis=1)
-
-        df["atr_14"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-
-        plus_dm = (high - high.shift(1)).clip(lower=0).where(
-            (high - high.shift(1)) > (low.shift(1) - low), 0
-        )
-        minus_dm = (low.shift(1) - low).clip(lower=0).where(
-            (low.shift(1) - low) > (high - high.shift(1)), 0
-        )
-        atr14 = df["atr_14"].replace(0, np.nan)
-        pdi = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
-        mdi = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
-        dx = (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan) * 100
-        df["adx_14"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
-        df["adx_pdi"] = pdi
-        df["adx_mdi"] = mdi
-
-        if "vwap" not in df.columns or df["vwap"].isna().all():
-            typical = (high + low + close) / 3
-            cum_vol = volume.replace(0, np.nan).cumsum()
-            df["vwap"] = (typical * volume).cumsum() / cum_vol
-
-        return df
-
-
-    async def _apply_strategy_signals(self, df: pd.DataFrame, strategy_id: str = "") -> pd.DataFrame:
-        """
-        Apply generated strategy code from DB when strategy_id is supplied.
-        Falls back to default EMA crossover only when no generated code is available.
-        """
-        if not strategy_id:
-            return self._compute_signals(df)
-
-        try:
-            row = await db.fetchrow(
-                "SELECT name, code FROM strategies WHERE id=$1",
-                uuid.UUID(strategy_id),
-            )
-        except Exception:
-            row = await db.fetchrow(
-                "SELECT name, code FROM strategies WHERE id=$1",
-                strategy_id,
-            )
-
-        if not row or not row.get("code"):
-            logger.warning("[backtest] No generated code found for {}; using default signals", strategy_id)
-            return self._compute_signals(df)
-
-        namespace: dict[str, Any] = {}
-        try:
-            exec(row["code"], namespace)
-        except Exception as exc:
-            logger.warning("[backtest] Generated strategy code exec failed for {}: {}; using default signals", strategy_id, exc)
-            return self._compute_signals(df)
-
-        try:
-            from strategy_engine.base_strategy import BaseStrategy
-            strategy_cls = None
-            for obj in namespace.values():
-                if inspect.isclass(obj) and issubclass(obj, BaseStrategy) and obj is not BaseStrategy:
-                    strategy_cls = obj
-                    break
-
-            if not strategy_cls:
-                logger.warning("[backtest] No BaseStrategy subclass found for {}; using default signals", strategy_id)
-                return self._compute_signals(df)
-
-            # Generated strategy classes currently use one of these constructor styles:
-            #   __init__(parameters=None)
-            #   __init__(name, symbols)
-            #   __init__(symbols)
-            #   __init__()
-            symbols = [str(df.get("symbol", pd.Series([""])).iloc[0])] if "symbol" in df.columns else [str(row["name"]).split("_")[0].upper()]
-
-            for args, kwargs in [
-                ((), {"parameters": {}}),
-                (({},), {}),
-                ((), {"name": row["name"], "symbols": symbols}),
-                ((), {"symbols": symbols}),
-                ((), {}),
-            ]:
-                try:
-                    strategy = strategy_cls(*args, **kwargs)
-                    break
-                except TypeError:
-                    strategy = None
-
-            if strategy is None:
-                logger.warning("[backtest] Could not instantiate generated strategy {}; using default signals", strategy_id)
-                return self._compute_signals(df)
-
-            # Most generated strategies evaluate only the latest bar.
-            # For backtesting, run them on expanding windows so every bar is evaluated
-            # as if it were the live/latest bar at that historical point.
-            raw_signals = []
-            min_warmup = min(250, max(50, len(df) // 100))
-            start_i = max(min_warmup, len(df) - 300)
-            for i in range(len(df)):
-                if i < start_i:
-                    raw_signals.append(0)
-                    continue
-                window = df.iloc[: i + 1].copy()
-                try:
-                    s_window = strategy.generate_signals(window)
-                    raw_signals.append(s_window.iloc[-1] if s_window is not None and len(s_window) else 0)
-                except Exception:
-                    raw_signals.append(0)
-
-            signals = pd.Series(raw_signals, index=df.index)
-
-            try:
-                logger.info(
-                    "[backtest] {} signal distribution: {}",
-                    strategy_id,
-                    pd.Series(signals).astype(str).value_counts(dropna=False).head(20).to_dict()
-                )
-            except Exception as exc:
-                logger.warning("[backtest] Could not log signal distribution for {}: {}", strategy_id, exc)
-
-            if signals is None or len(signals) == 0:
-                logger.warning("[backtest] Strategy {} returned empty signals; using default signals", strategy_id)
-                return self._compute_signals(df)
-
-            out = df.copy()
-
-            def _signal_to_num(x):
-                # Supports numeric, Signal enum, strings, and TradeSignal-like objects.
-                if hasattr(x, "signal"):
-                    x = x.signal
-                if hasattr(x, "value"):
-                    x = x.value
-                if isinstance(x, str):
-                    y = x.upper()
-                    if y == "BUY":
-                        return 1.0
-                    if y == "SELL":
-                        return -1.0
-                    if y in ("HOLD", "CLOSE", "EXIT", "FLAT", "NONE"):
-                        return 0.0
-                    try:
-                        return float(x)
-                    except Exception:
-                        return 0.0
-                try:
-                    return float(x)
-                except Exception:
-                    return 0.0
-
-            sig = pd.Series(signals).reindex(out.index).fillna(0).map(_signal_to_num).astype(float)
-            sig = sig.clip(-1, 1)
-
-            out["signal"] = sig
-            out["pos_change"] = out["signal"].diff().fillna(out["signal"])
-
-            logger.info("[backtest] Applied generated strategy signals for {} ({})", strategy_id, row["name"])
-            return out
-
-        except Exception as exc:
-            logger.warning("[backtest] Generated strategy signal application failed for {}: {}; using default signals", strategy_id, exc)
-            return self._compute_signals(df)
 
     @staticmethod
     def _daily_equity_curve(equity: list[dict]) -> list[dict]:
@@ -552,8 +339,7 @@ class BacktestEngine:
                 f"Found {actual_days} days from {df['timestamp'].min()} to {df['timestamp'].max()}."
             )
 
-        df = self._enrich_generated_strategy_features(df)
-        df = await self._apply_strategy_signals(df, strategy_id)
+        df = self._compute_signals(df)
         backtest_df, monte_carlo_df = self._split(df)
 
         results: dict[str, BacktestResult] = {}
@@ -596,6 +382,10 @@ class BacktestEngine:
             sid = uuid.UUID(r.strategy_id) if r.strategy_id else None
             await db.execute(
                 """INSERT INTO backtests
+                r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
+                r.initial_capital, r.final_capital, r.start_date, r.end_date,
+                r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
+                r.initial_capital, r.final_capital, r.start_date, r.end_date,
                    (id,strategy_id,sharpe,sortino,max_drawdown,win_rate,
                     annualized_return,total_return,profit_factor,total_trades,
                     winning_trades,losing_trades,avg_win,avg_loss,
@@ -606,6 +396,14 @@ class BacktestEngine:
                 uuid.UUID(r.run_id), sid,
                 r.sharpe_ratio, r.sortino_ratio, r.max_drawdown, r.win_rate,
                 r.annualized_return, r.total_return, r.profit_factor, r.total_trades,
+                r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
+                r.initial_capital, r.final_capital, r.start_date, r.end_date,
+                r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
+                r.initial_capital, r.final_capital, r.start_date, r.end_date,
+                r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
+                r.initial_capital, r.final_capital, r.start_date, r.end_date,
+                r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
+                r.initial_capital, r.final_capital, r.start_date, r.end_date,
                 r.winning_trades, r.losing_trades, r.avg_win, r.avg_loss,
                 r.initial_capital, r.final_capital, r.start_date, r.end_date,
                 [r.symbol], json.dumps(r.parameters), json.dumps(r.equity_curve[-200:]),

@@ -54,27 +54,10 @@ class BaseStrategy(ABC):
 
     strategy_type: str = "base"
 
-    def __init__(
-        self,
-        name: str | None = None,
-        symbols: list[str] | None = None,
-        parameters: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Backward-compatible constructor.
-
-        Supports both:
-        - BaseStrategy(name, symbols, parameters)
-        - BaseStrategy(parameters={...})
-        - BaseStrategy(parameters)
-        """
-        if isinstance(name, dict) and symbols is None and parameters is None:
-            parameters = name
-            name = None
-
+    def __init__(self, name: str, symbols: list[str], parameters: dict[str, Any] | None = None) -> None:
         self.id         = uuid.uuid4()
-        self.name       = name or self.__class__.__name__
-        self.symbols    = symbols or list((parameters or {}).get("symbols", []))
+        self.name       = name
+        self.symbols    = symbols
         self.parameters = parameters or {}
         self.is_active  = False
         self.is_paper   = True

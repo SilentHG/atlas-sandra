@@ -135,69 +135,6 @@ class BacktestEngine:
         df["pos_change"] = df["signal"].diff().fillna(0)
         return df
 
-    @staticmethod
-    def _enrich_generated_strategy_features(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Add ATLAS-style indicator columns expected by generated strategies:
-        ema_9, ema_21, ema_50, rsi_14, atr_14, adx_14, volume_ma_20, vwap, etc.
-        """
-        df = df.copy()
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-        volume = df["volume"]
-
-        for p in (5, 9, 10, 20, 21, 50, 100, 200):
-            if len(df) >= p:
-                df[f"ema_{p}"] = close.ewm(span=p, adjust=False).mean()
-                df[f"sma_{p}"] = close.rolling(p).mean()
-
-        for p in (10, 20, 50):
-            if len(df) >= p:
-                df[f"volume_ma_{p}"] = volume.rolling(p).mean()
-                df[f"volume_sma_{p}"] = volume.rolling(p).mean()
-
-        def _rsi(series, p=14):
-            d = series.diff()
-            gain = d.clip(lower=0).ewm(alpha=1 / p, adjust=False).mean()
-            loss = (-d.clip(upper=0)).ewm(alpha=1 / p, adjust=False).mean()
-            rs = gain / loss.replace(0, np.nan)
-            return 100 - 100 / (1 + rs)
-
-        for p in (7, 14):
-            df[f"rsi_{p}"] = _rsi(close, p)
-
-        pc = close.shift(1)
-        tr = pd.concat([
-            high - low,
-            (high - pc).abs(),
-            (low - pc).abs()
-        ], axis=1).max(axis=1)
-
-        df["atr_14"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-
-        plus_dm = (high - high.shift(1)).clip(lower=0).where(
-            (high - high.shift(1)) > (low.shift(1) - low), 0
-        )
-        minus_dm = (low.shift(1) - low).clip(lower=0).where(
-            (low.shift(1) - low) > (high - high.shift(1)), 0
-        )
-        atr14 = df["atr_14"].replace(0, np.nan)
-        pdi = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
-        mdi = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
-        dx = (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan) * 100
-        df["adx_14"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
-        df["adx_pdi"] = pdi
-        df["adx_mdi"] = mdi
-
-        if "vwap" not in df.columns or df["vwap"].isna().all():
-            typical = (high + low + close) / 3
-            cum_vol = volume.replace(0, np.nan).cumsum()
-            df["vwap"] = (typical * volume).cumsum() / cum_vol
-
-        return df
-
-
     async def _apply_strategy_signals(self, df: pd.DataFrame, strategy_id: str = "") -> pd.DataFrame:
         """
         Apply generated strategy code from DB when strategy_id is supplied.
@@ -264,24 +201,7 @@ class BacktestEngine:
                 logger.warning("[backtest] Could not instantiate generated strategy {}; using default signals", strategy_id)
                 return self._compute_signals(df)
 
-            # Most generated strategies evaluate only the latest bar.
-            # For backtesting, run them on expanding windows so every bar is evaluated
-            # as if it were the live/latest bar at that historical point.
-            raw_signals = []
-            min_warmup = min(250, max(50, len(df) // 100))
-            start_i = max(min_warmup, len(df) - 300)
-            for i in range(len(df)):
-                if i < start_i:
-                    raw_signals.append(0)
-                    continue
-                window = df.iloc[: i + 1].copy()
-                try:
-                    s_window = strategy.generate_signals(window)
-                    raw_signals.append(s_window.iloc[-1] if s_window is not None and len(s_window) else 0)
-                except Exception:
-                    raw_signals.append(0)
-
-            signals = pd.Series(raw_signals, index=df.index)
+            signals = strategy.generate_signals(df.copy())
 
             try:
                 logger.info(
@@ -552,7 +472,6 @@ class BacktestEngine:
                 f"Found {actual_days} days from {df['timestamp'].min()} to {df['timestamp'].max()}."
             )
 
-        df = self._enrich_generated_strategy_features(df)
         df = await self._apply_strategy_signals(df, strategy_id)
         backtest_df, monte_carlo_df = self._split(df)
 

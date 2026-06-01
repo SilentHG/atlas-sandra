@@ -21,10 +21,10 @@ const API=location.origin.includes("47.130.131.155")?"http://47.130.131.155:8080
 function setBusy(v,msg="Working..."){
   state.busy=v;
   state.lastActionAt=Date.now();
-
-  // Do NOT disable every dashboard button.
-  // Global button disabling made the whole terminal look like it was refreshing.
-  // Individual actions should manage their own local result panel/button state.
+  document.querySelectorAll("button").forEach(b=>{
+    if(v && !b.dataset.keepEnabled){b.disabled=true;b.classList.add("loading")}
+    if(!v){b.disabled=false;b.classList.remove("loading")}
+  });
   if(v) toast(msg,"blue");
 }
 
