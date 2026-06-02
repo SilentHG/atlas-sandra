@@ -571,29 +571,6 @@ class BacktestEngine:
 
     # ── Public entry point ────────────────────────────────────────────────────
 
-
-    @staticmethod
-    def _resample_ohlcv(df: pd.DataFrame, rule: str = "1h") -> pd.DataFrame:
-        """Resample minute OHLCV data into strategy timeframe candles."""
-        if df.empty or "timestamp" not in df.columns:
-            return df
-
-        x = df.copy()
-        x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
-        x = x.dropna(subset=["timestamp"]).sort_values("timestamp")
-        x = x.set_index("timestamp")
-
-        agg = {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-
-        out = x.resample(rule).agg(agg).dropna().reset_index()
-        return out
-
     async def run(
         self,
         symbol:      str,
@@ -633,15 +610,6 @@ class BacktestEngine:
                 f"Minimum 2 years historical data required for {symbol}. "
                 f"Found {actual_days} days from {df['timestamp'].min()} to {df['timestamp'].max()}."
             )
-
-        # Most strategies are declared as 1h systems; use hourly candles for realistic evaluation.
-        if parameters and parameters.get("timeframe"):
-            tf = str(parameters.get("timeframe")).lower()
-        else:
-            tf = "1h"
-
-        if tf in ("1h", "60m", "hour", "hourly"):
-            df = self._resample_ohlcv(df, "1h")
 
         df = self._enrich_generated_strategy_features(df)
         df = await self._apply_strategy_signals(df, strategy_id)

@@ -208,12 +208,12 @@ class BacktestEngine:
 
         try:
             row = await db.fetchrow(
-                "SELECT name, code, parameters FROM strategies WHERE id=$1",
+                "SELECT name, code FROM strategies WHERE id=$1",
                 uuid.UUID(strategy_id),
             )
         except Exception:
             row = await db.fetchrow(
-                "SELECT name, code, parameters FROM strategies WHERE id=$1",
+                "SELECT name, code FROM strategies WHERE id=$1",
                 strategy_id,
             )
 
@@ -247,28 +247,10 @@ class BacktestEngine:
             #   __init__()
             symbols = [str(df.get("symbol", pd.Series([""])).iloc[0])] if "symbol" in df.columns else [str(row["name"]).split("_")[0].upper()]
 
-            raw_params = row.get("parameters") if hasattr(row, "get") else row["parameters"]
-            if raw_params is None:
-                db_params = {}
-            elif isinstance(raw_params, dict):
-                db_params = raw_params
-            elif isinstance(raw_params, str):
-                try:
-                    db_params = json.loads(raw_params)
-                except Exception:
-                    db_params = {}
-            else:
-                try:
-                    db_params = dict(raw_params)
-                except Exception:
-                    db_params = {}
-
             for args, kwargs in [
-                ((), {"parameters": db_params}),
-                ((db_params,), {}),
-                ((), {"name": row["name"], "symbols": symbols, "parameters": db_params}),
+                ((), {"parameters": {}}),
+                (({},), {}),
                 ((), {"name": row["name"], "symbols": symbols}),
-                ((), {"symbols": symbols, "parameters": db_params}),
                 ((), {"symbols": symbols}),
                 ((), {}),
             ]:
@@ -347,40 +329,8 @@ class BacktestEngine:
                 except Exception:
                     return 0.0
 
-            raw_sig = pd.Series(signals).reindex(out.index)
-
-            def _event_to_position(x, prev):
-                if hasattr(x, "signal"):
-                    x = x.signal
-                if hasattr(x, "value"):
-                    x = x.value
-                if isinstance(x, str):
-                    y = x.upper()
-                    if y == "BUY":
-                        return 1.0
-                    if y == "SELL":
-                        return -1.0
-                    if y in ("CLOSE", "EXIT", "FLAT"):
-                        return 0.0
-                    if y in ("HOLD", "NONE", "NAN"):
-                        return prev
-                try:
-                    v = float(x)
-                    if v > 0:
-                        return 1.0
-                    if v < 0:
-                        return -1.0
-                    return prev
-                except Exception:
-                    return prev
-
-            positions = []
-            prev = 0.0
-            for x in raw_sig:
-                prev = _event_to_position(x, prev)
-                positions.append(prev)
-
-            sig = pd.Series(positions, index=out.index).fillna(0).astype(float).clip(-1, 1)
+            sig = pd.Series(signals).reindex(out.index).fillna(0).map(_signal_to_num).astype(float)
+            sig = sig.clip(-1, 1)
 
             out["signal"] = sig
             out["pos_change"] = out["signal"].diff().fillna(out["signal"])
@@ -571,29 +521,6 @@ class BacktestEngine:
 
     # ── Public entry point ────────────────────────────────────────────────────
 
-
-    @staticmethod
-    def _resample_ohlcv(df: pd.DataFrame, rule: str = "1h") -> pd.DataFrame:
-        """Resample minute OHLCV data into strategy timeframe candles."""
-        if df.empty or "timestamp" not in df.columns:
-            return df
-
-        x = df.copy()
-        x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True, errors="coerce")
-        x = x.dropna(subset=["timestamp"]).sort_values("timestamp")
-        x = x.set_index("timestamp")
-
-        agg = {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-
-        out = x.resample(rule).agg(agg).dropna().reset_index()
-        return out
-
     async def run(
         self,
         symbol:      str,
@@ -633,15 +560,6 @@ class BacktestEngine:
                 f"Minimum 2 years historical data required for {symbol}. "
                 f"Found {actual_days} days from {df['timestamp'].min()} to {df['timestamp'].max()}."
             )
-
-        # Most strategies are declared as 1h systems; use hourly candles for realistic evaluation.
-        if parameters and parameters.get("timeframe"):
-            tf = str(parameters.get("timeframe")).lower()
-        else:
-            tf = "1h"
-
-        if tf in ("1h", "60m", "hour", "hourly"):
-            df = self._resample_ohlcv(df, "1h")
 
         df = self._enrich_generated_strategy_features(df)
         df = await self._apply_strategy_signals(df, strategy_id)
