@@ -259,7 +259,7 @@ async def run_strategy_coder(
 
     if not rows:
         logger.info("[strategy_coder] No pending strategies found.")
-        # db.close_pool() disabled here; caller owns pool lifecycle.
+        await db.close_pool()
         return []
 
     logger.info("[strategy_coder] {} strategies to code", len(rows))
@@ -281,7 +281,7 @@ async def run_strategy_coder(
                 name, exc, exc_info=True,
             )
 
-    # db.close_pool() disabled here; caller owns pool lifecycle.
+    await db.close_pool()
     logger.info(
         "[strategy_coder] Done. {}/{} strategies coded: {}",
         len(coded), len(rows), coded,

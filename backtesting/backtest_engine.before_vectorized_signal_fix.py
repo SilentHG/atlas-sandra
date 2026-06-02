@@ -264,32 +264,24 @@ class BacktestEngine:
                 logger.warning("[backtest] Could not instantiate generated strategy {}; using default signals", strategy_id)
                 return self._compute_signals(df)
 
-            # First try full vectorized strategy evaluation.
-            # This is required for high-volume factory testing and template strategies.
-            try:
-                signals = strategy.generate_signals(df.copy())
-                signals = pd.Series(signals).reindex(df.index).fillna(0)
-            except Exception:
-                signals = pd.Series(0, index=df.index)
+            # Most generated strategies evaluate only the latest bar.
+            # For backtesting, run them on expanding windows so every bar is evaluated
+            # as if it were the live/latest bar at that historical point.
+            raw_signals = []
+            min_warmup = min(250, max(50, len(df) // 100))
+            start_i = max(min_warmup, len(df) - 60)
+            for i in range(len(df)):
+                if i < start_i:
+                    raw_signals.append(0)
+                    continue
+                window = df.iloc[: i + 1].copy()
+                try:
+                    s_window = strategy.generate_signals(window)
+                    raw_signals.append(s_window.iloc[-1] if s_window is not None and len(s_window) else 0)
+                except Exception:
+                    raw_signals.append(0)
 
-            # If the generated strategy only evaluates the latest bar and returns no
-            # useful historical signals, fall back to limited rolling evaluation.
-            non_hold = pd.Series(signals).astype(str).str.upper().isin(["BUY", "SELL", "CLOSE", "1", "-1"]).sum()
-            if non_hold < 3:
-                raw_signals = []
-                min_warmup = min(250, max(50, len(df) // 100))
-                start_i = max(min_warmup, len(df) - 60)
-                for i in range(len(df)):
-                    if i < start_i:
-                        raw_signals.append(0)
-                        continue
-                    window = df.iloc[: i + 1].copy()
-                    try:
-                        s_window = strategy.generate_signals(window)
-                        raw_signals.append(s_window.iloc[-1] if s_window is not None and len(s_window) else 0)
-                    except Exception:
-                        raw_signals.append(0)
-                signals = pd.Series(raw_signals, index=df.index)
+            signals = pd.Series(raw_signals, index=df.index)
 
             try:
                 logger.info(

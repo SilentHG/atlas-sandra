@@ -405,7 +405,7 @@ async def run_ideator(
         "[ideator] Done. {}/{} strategies saved: {}",
         len(saved_ids), len(prompts), saved_ids,
     )
-    # db.close_pool() disabled here; caller owns pool lifecycle.
+    await db.close_pool()
     return saved_ids
 
 
@@ -513,5 +513,5 @@ async def run_ideator_dynamic(
         logger.error("[ideator] Dynamic generation failed: {}", exc, exc_info=True)
         raise
         raise
-    # db.close_pool() disabled here; caller owns pool lifecycle.
+    await db.close_pool()
     return saved_ids
