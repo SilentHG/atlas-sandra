@@ -451,28 +451,40 @@ async def list_strategies():
         raise HTTPException(500, str(exc))
 
 
+
 @app.get("/api/dashboard/strategies-live")
-async def dashboard_strategies_live(limit: int = 60):
+async def dashboard_strategies_live(limit: int = 120):
+    """
+    Dashboard-ready strategy list ranked by latest linked backtest.
+    Shows real active/backtested/passing strategies instead of returning an empty set.
+    """
     try:
         rows = await db.fetch(
             """
             SELECT
-              s.id,
+              s.id::text AS id,
               s.name,
               s.strategy_type,
               s.status,
               s.symbols,
-              s.description,
-              s.created_at,
-              bt.completed_at AS last_backtest_at,
-              bt.sharpe,
-              bt.sortino,
-              bt.max_drawdown,
-              bt.win_rate,
-              bt.profit_factor,
-              bt.total_trades,
-              bt.total_return,
-              bt.annualized_return
+              COALESCE(s.description, '') AS description,
+              s.created_at::text AS created_at,
+              bt.completed_at::text AS last_backtest_at,
+              COALESCE(bt.sharpe, 0) AS sharpe,
+              COALESCE(bt.sortino, 0) AS sortino,
+              COALESCE(bt.max_drawdown, 0) AS max_drawdown,
+              COALESCE(bt.win_rate, 0) AS win_rate,
+              COALESCE(bt.profit_factor, 0) AS profit_factor,
+              COALESCE(bt.total_trades, 0) AS total_trades,
+              COALESCE(bt.total_return, 0) AS total_return,
+              COALESCE(bt.annualized_return, 0) AS annualized_return,
+              CASE
+                WHEN bt.total_trades >= 30
+                 AND bt.sharpe > 1
+                 AND bt.profit_factor > 1.2
+                 AND bt.max_drawdown > -0.10
+                THEN true ELSE false
+              END AS passed
             FROM strategies s
             LEFT JOIN LATERAL (
               SELECT *
@@ -484,19 +496,32 @@ async def dashboard_strategies_live(limit: int = 60):
             WHERE s.status IN ('active','failed','backtesting','pending','paper_trading','live_ready')
             ORDER BY
               CASE
-                WHEN s.status='live_ready' THEN 1
-                WHEN s.status='paper_trading' THEN 2
-                WHEN s.status='active' THEN 3
-                WHEN s.status='backtesting' THEN 4
-                WHEN s.status='pending' THEN 5
-                ELSE 6
+                WHEN bt.total_trades >= 30
+                 AND bt.sharpe > 1
+                 AND bt.profit_factor > 1.2
+                 AND bt.max_drawdown > -0.10
+                THEN 0 ELSE 1
               END,
+              COALESCE(bt.sharpe, -999) DESC,
+              s.updated_at DESC NULLS LAST,
               s.created_at DESC
             LIMIT $1
             """,
-            limit,
+            max(1, int(limit)),
         )
-        return [dict(r) for r in rows]
+        import math
+
+        clean = []
+        for r in rows:
+            row = dict(r)
+            for k, v in list(row.items()):
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    # JSON cannot serialize NaN/Infinity. Cap infinite profit factor
+                    # to a large dashboard-safe value instead of crashing.
+                    row[k] = 999.0 if k == "profit_factor" else 0.0
+            clean.append(row)
+
+        return clean
     except Exception as exc:
         logger.error("[api] dashboard_strategies_live error: {}", exc)
         raise HTTPException(500, str(exc))
@@ -1003,28 +1028,53 @@ async def dashboard_orders_live(limit: int = 20):
         return []
 
 
+
 @app.get("/api/dashboard/alerts-live")
 async def dashboard_alerts_live(limit: int = 10):
+    """
+    Live dashboard alerts from latest strategy/backtest results.
+    Replaces old scout/YOUTUBE placeholder alerts.
+    """
     try:
         rows = await db.fetch(
             """
-            SELECT source, source_url, description, confidence, scout, created_at
-            FROM strategy_hypotheses
-            ORDER BY created_at DESC
+            SELECT
+              s.name,
+              s.strategy_type,
+              b.total_trades,
+              b.sharpe,
+              b.profit_factor,
+              b.max_drawdown,
+              b.completed_at::text AS completed_at
+            FROM backtests b
+            JOIN strategies s ON s.id = b.strategy_id
+            ORDER BY b.completed_at DESC
             LIMIT $1
             """,
-            limit,
+            max(1, int(limit)),
         )
+
         alerts = []
         for r in rows:
+            passed = (
+                (r["total_trades"] or 0) > 0
+                and (r["sharpe"] or 0) > 1
+                and (r["profit_factor"] or 0) > 1.2
+                and (r["max_drawdown"] or 0) > -0.10
+            )
             alerts.append({
-                "type": "signal",
-                "severity": "info",
-                "title": f"{str(r['source']).upper()} hypothesis",
-                "message": r["description"],
-                "confidence": float(r["confidence"] or 0),
-                "source_url": r["source_url"],
-                "created_at": r["created_at"],
+                "type": "strategy_backtest",
+                "severity": "success" if passed else "info",
+                "title": "PASSING strategy" if passed else "Strategy backtest",
+                "message": (
+                    f"{r['name']} | trades={r['total_trades']} | "
+                    f"sharpe={round(float(r['sharpe'] or 0), 3)} | "
+                    f"PF={round(float(r['profit_factor'] or 0), 3)} | "
+                    f"DD={round(float(r['max_drawdown'] or 0), 4)}"
+                ),
+                "confidence": 1.0 if passed else 0.5,
+                "source_url": None,
+                "created_at": r["completed_at"],
             })
         return alerts
     except Exception as exc:
@@ -1305,6 +1355,33 @@ async def test_order(req: OrderRequest):
         logger.error("[api] test_order error: {}", exc)
         raise HTTPException(500, str(exc))
 
+
+
+
+@app.get("/api/dashboard/scout-results")
+async def dashboard_scout_results(limit: int = 12):
+    try:
+        rows = await db.fetch(
+            """
+            SELECT
+              source,
+              source_url,
+              description,
+              entry_rules,
+              exit_rules,
+              confidence,
+              scout,
+              created_at::text AS created_at
+            FROM strategy_hypotheses
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            max(1, int(limit)),
+        )
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        logger.error("[api] dashboard_scout_results error: {}", exc)
+        raise HTTPException(500, str(exc))
 
 
 @app.get("/api/dashboard/scout-status")

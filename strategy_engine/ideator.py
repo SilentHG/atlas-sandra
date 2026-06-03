@@ -207,6 +207,25 @@ def _get_claude_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=key)
 
 
+
+
+def _extract_json_object(raw: str) -> str:
+    """Extract the first complete JSON object from Claude text."""
+    text = raw.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]) if lines and lines[-1].strip() == "```" else "\n".join(lines[1:])
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in Claude response")
+
+    return text[start:end + 1]
+
+
 # ── LLM call ─────────────────────────────────────────────────────────────────
 
 
@@ -234,16 +253,34 @@ async def _generate_spec(
     raw  = await loop.run_in_executor(None, _call)
     logger.debug("[ideator] Raw response ({} chars)", len(raw))
 
-    # Strip markdown code fences if the model wrapped the JSON
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        raw   = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
-
     try:
-        spec = json.loads(raw)
+        spec = json.loads(_extract_json_object(raw))
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Claude returned invalid JSON: {exc}\n---\n{raw}") from exc
+        # One retry with a stricter repair instruction.
+        logger.warning("[ideator] Claude returned invalid JSON; retrying once with strict JSON-only prompt: {}", exc)
+
+        repair_prompt = (
+            user_prompt
+            + "\n\nReturn ONLY one complete valid JSON object. "
+            + "No markdown, no explanation, no trailing comments. "
+            + "All strings must be closed and escaped correctly."
+        )
+
+        def _repair_call() -> str:
+            msg = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": repair_prompt}],
+            )
+            return msg.content[0].text.strip()
+
+        raw2 = await loop.run_in_executor(None, _repair_call)
+
+        try:
+            spec = json.loads(_extract_json_object(raw2))
+        except json.JSONDecodeError as exc2:
+            raise ValueError(f"Claude returned invalid JSON after retry: {exc2}\n---\n{raw2}") from exc2
 
     # Validate required keys
     required = {
